@@ -1014,14 +1014,14 @@ func (wp *WorkerPool) Results() <-chan Result {
 
 // ExecWorkerPool for running exec command on multiple targets
 type ExecWorkerPool struct {
-	workers  int
-	tasks    chan string
-	wg       sync.WaitGroup
-	config   *ExecConfig
-	client   *http.Client
-	logger   *Logger
-	success  int64
-	failed   int64
+	workers int
+	tasks   chan string
+	wg      sync.WaitGroup
+	config  *ExecConfig
+	client  *http.Client
+	logger  *Logger
+	success int64
+	failed  int64
 }
 
 func NewExecWorkerPool(workers int, config *ExecConfig, logger *Logger) *ExecWorkerPool {
@@ -1047,10 +1047,10 @@ func (wp *ExecWorkerPool) worker() {
 	for target := range wp.tasks {
 		// Parse target (could be ip:port format)
 		host, port := parseTarget(target, wp.config.Port)
-		
-		err := execCmdOnTarget(host, port, wp.config.Path, wp.config.Protocol, 
+
+		err := execCmdOnTarget(host, port, wp.config.Path, wp.config.Protocol,
 			wp.config.Insecure, wp.config.Timeout, wp.config.Command, wp.client, wp.logger)
-		
+
 		if err != nil {
 			atomic.AddInt64(&wp.failed, 1)
 			wp.logger.Error("%s - Execution failed: %v", target, err)
@@ -1077,14 +1077,14 @@ func (wp *ExecWorkerPool) Stats() (success, failed int64) {
 // parseTarget parses a target string that may contain port (ip:port or just ip)
 func parseTarget(target string, defaultPort int) (string, int) {
 	target = strings.TrimSpace(target)
-	
+
 	// Remove protocol prefix if present
 	if strings.HasPrefix(target, "https://") {
 		target = target[8:]
 	} else if strings.HasPrefix(target, "http://") {
 		target = target[7:]
 	}
-	
+
 	// Check for port
 	if idx := strings.LastIndex(target, ":"); idx != -1 {
 		// Make sure it's not an IPv6 address without port
@@ -1102,12 +1102,12 @@ func parseTarget(target string, defaultPort int) (string, int) {
 			}
 		}
 	}
-	
+
 	// Remove any path from host
 	if pathIdx := strings.Index(target, "/"); pathIdx != -1 {
 		target = target[:pathIdx]
 	}
-	
+
 	return target, defaultPort
 }
 
@@ -1123,28 +1123,77 @@ func parseTargetList(targetList string) []string {
 	return targets
 }
 
+// OutputWriter handles real-time writing of results to file
+type OutputWriter struct {
+	file   *os.File
+	writer *bufio.Writer
+	mu     sync.Mutex
+}
+
+func NewOutputWriter(filename string) (*OutputWriter, error) {
+	if filename == "" {
+		return nil, nil
+	}
+
+	file, err := os.Create(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	return &OutputWriter{
+		file:   file,
+		writer: bufio.NewWriter(file),
+	}, nil
+}
+
+func (ow *OutputWriter) Write(host string) error {
+	if ow == nil {
+		return nil
+	}
+
+	ow.mu.Lock()
+	defer ow.mu.Unlock()
+
+	_, err := ow.writer.WriteString(host + "\n")
+	if err != nil {
+		return err
+	}
+
+	// Flush immediately to ensure real-time writing
+	return ow.writer.Flush()
+}
+
+func (ow *OutputWriter) Close() error {
+	if ow == nil {
+		return nil
+	}
+
+	ow.mu.Lock()
+	defer ow.mu.Unlock()
+
+	if err := ow.writer.Flush(); err != nil {
+		return err
+	}
+	return ow.file.Close()
+}
+
 func runScan(targets []string, config *ScanConfig, output string, logger *Logger) {
 	initPayloads()
 
 	stats := &Stats{Total: int64(len(targets))}
 	memLimiter := NewMemoryLimiter(config.MaxMemoryMB)
 
-	var outFile *os.File
-	var outWriter *bufio.Writer
-	if output != "" && config.StreamMode {
-		var err error
-		outFile, err = os.Create(output)
-		if err != nil {
-			logger.Error("Failed to create output file: %v", err)
-			os.Exit(1)
-		}
-		defer outFile.Close()
-		outWriter = bufio.NewWriter(outFile)
-		defer outWriter.Flush()
+	// Create output writer for real-time file writing
+	outWriter, err := NewOutputWriter(output)
+	if err != nil {
+		logger.Error("Failed to create output file: %v", err)
+		os.Exit(1)
+	}
+	if outWriter != nil {
+		defer outWriter.Close()
 	}
 
 	var results []Result
-	var vulnerableHosts []string
 	var resultsMu sync.Mutex
 
 	startTime := time.Now()
@@ -1167,6 +1216,9 @@ func runScan(targets []string, config *ScanConfig, output string, logger *Logger
 	if config.ExecOnVuln {
 		logger.Info("Will execute command on vulnerable hosts: %s", config.ExecCommand)
 	}
+	if output != "" {
+		logger.Info("Writing results to: %s (real-time)", output)
+	}
 
 	pool := NewWorkerPool(config.Threads, config, memLimiter)
 	pool.Start()
@@ -1188,13 +1240,23 @@ func runScan(targets []string, config *ScanConfig, output string, logger *Logger
 		defer putHTTPClient(execClient)
 	}
 
+	var vulnCount int64
+
 	for result := range pool.Results() {
 		scanned := atomic.AddInt64(&stats.Scanned, 1)
 
 		if result.Vulnerable {
 			atomic.AddInt64(&stats.Vulnerable, 1)
+			vulnCount++
 			logger.ClearLine()
 			logger.Vuln(result.Host, result.Evidence)
+
+			// Write to file immediately
+			if outWriter != nil {
+				if err := outWriter.Write(result.Host); err != nil {
+					logger.Error("Failed to write to output file: %v", err)
+				}
+			}
 
 			// Execute command on vulnerable host if enabled
 			if config.ExecOnVuln && config.ExecCommand != "" {
@@ -1204,14 +1266,6 @@ func runScan(targets []string, config *ScanConfig, output string, logger *Logger
 				if err != nil {
 					logger.Error("Failed to execute command on %s: %v", result.Host, err)
 				}
-			}
-
-			if config.StreamMode && outWriter != nil {
-				outWriter.WriteString(result.Host + "\n")
-			} else {
-				resultsMu.Lock()
-				vulnerableHosts = append(vulnerableHosts, result.Host)
-				resultsMu.Unlock()
 			}
 		} else if result.Error != "" {
 			atomic.AddInt64(&stats.Errors, 1)
@@ -1253,18 +1307,8 @@ func runScan(targets []string, config *ScanConfig, output string, logger *Logger
 		fmt.Fprintf(os.Stderr, "    Peak mem:   %.0fMB\n", GetMemoryUsageMB())
 	}
 
-	if output != "" && !config.StreamMode && len(vulnerableHosts) > 0 {
-		sb := getStringBuilder()
-		for _, h := range vulnerableHosts {
-			sb.WriteString(h)
-			sb.WriteByte('\n')
-		}
-		if err := os.WriteFile(output, []byte(sb.String()), 0644); err != nil {
-			logger.Error("Failed to write output: %v", err)
-		} else {
-			logger.Success("Saved %d vulnerable hosts to %s", len(vulnerableHosts), output)
-		}
-		putStringBuilder(sb)
+	if output != "" && vulnCount > 0 {
+		logger.Success("Saved %d vulnerable hosts to %s", vulnCount, output)
 	}
 
 	if stats.Vulnerable > 0 {
@@ -1336,7 +1380,7 @@ func cmdScan() {
 	timeout := fs.Int("timeout", 10, "Timeout in seconds")
 	threads := fs.Int("t", 10, "Concurrent threads")
 	safeMode := fs.Bool("safe", false, "Safe detection (no code execution)")
-	output := fs.String("o", "", "Output file for vulnerable hosts")
+	output := fs.String("o", "", "Output file for vulnerable hosts (real-time)")
 	jsonOut := fs.Bool("json", false, "JSON output")
 	verbose := fs.Bool("v", false, "Verbose output")
 	quiet := fs.Bool("q", false, "Quiet mode")
@@ -1501,7 +1545,7 @@ func cmdExec() {
 
 	// Check if multiple targets (comma-separated)
 	targets := parseTargetList(*target)
-	
+
 	if len(targets) == 1 {
 		// Single target mode
 		config := &ExecConfig{
@@ -1522,7 +1566,7 @@ func cmdExec() {
 	} else {
 		// Multi-target mode
 		logger.Info("Executing command on %d targets with %d threads", len(targets), *threads)
-		
+
 		config := &ExecConfig{
 			Port:     *port,
 			Path:     *path,
@@ -1594,7 +1638,7 @@ Scan Options:
   -timeout        Timeout in seconds (default: 10)
   -t              Concurrent threads (default: 10)
   -safe           Safe detection mode (no code execution)
-  -o              Output file for vulnerable hosts
+  -o              Output file for vulnerable hosts (real-time writing)
   -json           JSON output
   -v              Verbose output
   -q              Quiet mode
