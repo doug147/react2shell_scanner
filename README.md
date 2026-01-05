@@ -62,7 +62,7 @@ For detailed technical analysis of the vulnerability, see:
 The simplest method to install react2shell is using `go install`:
 
 ```bash
-go install github.com/doug147/react2shell@latest
+go install github.com/doug147/react2shell_scanner@latest
 ```
 
 This will download, compile, and install the binary to your `$GOPATH/bin` directory.
@@ -71,7 +71,7 @@ This will download, compile, and install the binary to your `$GOPATH/bin` direct
 
 ```bash
 # Clone the repository
-git clone https://github.com/doug147/react2shell.git
+git clone https://github.com/doug147/react2shell_scanner.git
 cd react2shell
 
 # Build the binary
